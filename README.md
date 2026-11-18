@@ -57,7 +57,32 @@ Local AI model weights (`.gguf`), personal memory (`memory.json`), and account t
 - **Move him:** Click and drag his dark body anywhere on your screen.
 - **Tuck him away:** Drag him to the **top-center** of your monitor to dock him into a compact top tab. Pull down on the tab to pop him back out.
 - **Open menus:** Right-click Mish (or click the small gear icon when hovering over him) to open **Active Tasks**, **Connections**, or **Customize**.
-- **Close any window:** Click `✕` in the top-right corner or press `Esc`.
+
+## Commands
+
+Mish supports both **`!` system/tool commands** (which work even if his AI brain is asleep or on strike) and **plain-text commands**.
+
+### `!` Bang Commands
+
+| Command | What it does |
+|---|---|
+| `!sys` | Shows CPU usage, system RAM, Mish's RAM footprint, and active AI model |
+| `!brain [main\|lite\|off\|auto]` | Checks brain status or manually switches between `main`, `lite`, `off`, and `auto` |
+| `!heavy [add\|remove <exe>]` | Lists or edits heavy apps that trigger Mish to shrink to `lite` / unload RAM |
+| `!open <app>` | Launches an app or sends Mish to search and open it from the Windows Start menu |
+| `!apps` | Lists all apps and custom aliases Mish knows how to open |
+| `!alias <name> [path]` | Adds a shortcut name for an app path (omit `path` to remove the alias) |
+| `!read <file path>` | Reads and summarizes a file (same as dropping a file onto Mish) |
+| `!clip2task` | Turns the first line of your clipboard into a new task |
+| `!focus [min]` / `!focus pomo [w] [b]` | Starts a focus timer or Pomodoro loop; also supports `pause`, `resume`, `stop` |
+| `!profile [name]` | Shows or switches your active focus profile (adjusts work vs. slacking app detection) |
+| `!sync` | Manually syncs Blackboard, Google, and Microsoft right now |
+| `!bb <ics_url>` | Saves your Blackboard calendar iCal feed URL and syncs it |
+| `!msid <client_id>` | Saves your Microsoft Azure Client ID for Outlook / To Do sign-in |
+| `!connect <google\|microsoft>` | Opens browser sign-in for Google or Microsoft |
+| `!mail <gmail\|microsoft> \| to \| subj \| body` | Sends an email directly from the command box |
+| `!clean` | Clears saved chat history and empties `Mish.log` (keeps tasks and facts safe) |
+| `!time` / `!ver` | Shows current time/day or Mish's version and active profile |
 
 ## A reminder
 
