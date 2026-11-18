@@ -109,8 +109,8 @@ Mish supports both **`!` system/tool commands** (which work even if his AI brain
 Mish follows an **`x.y.za`** versioning format:
 - **`x`** = Major milestone / full architecture overhaul
 - **`y`** = Major feature release
-- **`z`** = Small feature additions & major bug fixes
-- **`a`** = Minor bug fixes & small tweaks
+- **`z`** = Small feature additions
+- **`a`** = Bug fixes & small tweaks
 
 ### Released Versions
 
