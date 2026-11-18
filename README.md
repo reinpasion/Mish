@@ -104,7 +104,20 @@ Mish supports both **`!` system/tool commands** (which work even if his AI brain
 - **He can be a bit stupid sometimes:** Mish runs a tiny local model so he stays fast and lightweight on normal laptops. Expect occasional goofy answers, misunderstood context, or confidently wrong guesses—use `!clean` if his chat history gets messy.
 - **Bugs & rough edges:** Mish is an active personal project. If a window acts weird, a command hiccups, or something breaks, check `Mish.log` in your Mish data folder (`Documents\Mish\Mish.log`) and feel free to open an **Issue** on this GitHub repo with what happened and the log snippet.
 
-## A reminder
+## Version History
 
-- Your screen captures, clipboard reads, chat history, tasks, and tokens stay **only on your own computer**.
-- Never upload your personal `credentials.json`, tokens, `memory.json`, `settings.json`, or large `.gguf` model files if you share your folder online.
+Mish follows an **`x.y.za`** versioning format:
+- **`x`** = Major milestone / full architecture overhaul
+- **`y`** = Major feature release
+- **`z`** = Small feature additions & major bug fixes
+- **`a`** = Minor bug fixes & small tweaks
+
+### Released Versions
+
+| Version | Release Type | Highlights |
+| :--- | :--- | :--- |
+| **`0.3.00`** | Initial Release | First working build of Mish as a monolithic desktop companion (`mish.pyw`) with basic animated eyes, canned lines, and early local LLM chat support. |
+| **`0.4.00`** | Major Update | Modularized the codebase into the `mish/` package (`brain.py`, `ui.py`, `eyes.py`, `config.py`, `store.py`, `win_utils.py`); introduced dual `main`/`lite` GGUF model auto-swapping based on RAM/CPU load, window tracking, focus timers, and `!` bang commands. |
+| **`0.5.00`** | Major Update | Redesigned Mish into a dark obsidian squircle HUD with 2D spring-physics eye tracking, dynamic mood/state colors, top-center notch docking, and theme-adaptive (`Auto` / `Dark` / `Light`) 4x supersampled PIL panels (`Studio`, `Active Tasks`, `Connections`). |
+| **`0.5.10`** | Feature & Hub Update | Added the `AutomationHub` background scheduler (`APScheduler` + `SQLAlchemy`) with Blackboard iCal feed syncing, Google Calendar/Gmail integration, Microsoft Outlook/To Do integration, and focus profiles. |
+| **`0.5.21`** *(Current)* | Feature & Polish Update | Refined HUD panel auto-sizing and layout polish, added clipboard-to-task (`!clip2task`) and Start menu app search errands (`!open`), and published Mish's fine-tuned GGUF brain (`reiHien/MishV6`) alongside updated setup docs. |
