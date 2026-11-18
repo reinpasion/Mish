@@ -41,7 +41,7 @@ REACTION_COOLDOWN = 45           # seconds between window-switch reactions
 
 AMBIENT_MIN_GAP = 90             # minimum seconds between any unsolicited popups
 BRAIN_IDLE_UNLOAD_S = 15 * 60    # unload main brain to RAM after 15m idle
-__version__ = "0.5.2-alpha"
+__version__ = "0.5.21-beta"
 HOTKEY_MOD = 0x0001 | 0x4000     # MOD_ALT | MOD_NOREPEAT
 HOTKEY_VK = 0x4D                 # 'M' -> Alt+M global summon
 
