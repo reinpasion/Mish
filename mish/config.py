@@ -25,6 +25,7 @@ DATA_DIR = user_data_dir()
 
 
 # ---- brain ----
+ENABLE_LLM = False               # False = zero local GGUF RAM usage (automation + Ghost HUD only)
 MODEL_GLOB = "*.gguf"            # any .gguf in a "models" folder (biggest = main, smallest = lite)
 
 
@@ -206,4 +207,4 @@ HELP_TEXT = """Commands:
   !sys | !time | !clean | !brain | !heavy"""
 
 
-BANG_HELP = "Commands: !open, !apps, !alias, !read, !sys, !time, !clean, !brain, !heavy, !profile, !focus, !clip2task, !ver"
+BANG_HELP = "Commands: !sync, !bb, !connect, !mail, !msid, !open, !apps, !alias, !read, !sys, !time, !clean, !brain, !heavy, !profile, !focus, !clip2task, !ver"

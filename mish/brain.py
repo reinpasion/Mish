@@ -80,6 +80,7 @@ from .config import (
     VISION_KEEP_ALIVE,
     VISION_MODEL,
     WINDOW_SWITCH_CHANCE,
+    ENABLE_LLM,
     __version__,
 )
 from .win_utils import (
@@ -101,7 +102,9 @@ from .win_utils import (
     log,
     parse_when,
 )
-
+from .integrations import (
+    AutomationHub
+)
 
 _model_cache = {"t": 0.0, "names": None, "val": {"main": None, "lite": None}}
 
@@ -295,6 +298,7 @@ class Mish:
         self.store = Store(DATA_DIR / "memory.json")
         self.settings = Settings(DATA_DIR / "settings.json")
         self.brain = Brain()
+        self.hub = AutomationHub(self.store, self.ui)
         self.canned = self._load_canned()
         self.llm_lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -881,6 +885,11 @@ class Mish:
             "ver": self._bang_ver, "version": self._bang_ver,
             "profile": self._bang_profile, "clip2task": self._bang_clip2task,
             "focus": self._bang_focus,
+            "sync": lambda _r: (self.hub.sync_now_async(announce_empty=True), "Syncing Blackboard, Google & Microsoft...")[1],
+            "bb": self._bang_bb,
+            "msid": self._bang_msid,
+            "connect": self._bang_connect,
+            "mail": self._bang_mail,
         }
         handler = handlers.get(cmd)
         return handler(rest) if handler else "Unknown command. " + BANG_HELP
@@ -911,6 +920,44 @@ class Mish:
     def _bang_ver(self, _arg: str) -> str:
         prof = self.settings.data.get("profile", "general")
         return f"Mish v{__version__} (profile: {prof})"
+
+    def _bang_bb(self, arg: str) -> str:
+        if not arg:
+            return "Usage: !bb <blackboard_ics_url>"
+        self.hub.set_blackboard_url(arg)
+        self.hub.sync_now_async(announce_empty=True)
+        return "Saved Blackboard calendar link and started syncing!"
+
+    def _bang_msid(self, arg: str) -> str:
+        if not arg:
+            return "Usage: !msid <microsoft_client_id>"
+        self.hub.set_ms_client_id(arg)
+        return "Saved Microsoft Client ID. Run !connect microsoft to sign in."
+
+    def _bang_connect(self, arg: str) -> str:
+        target = arg.strip().lower()
+        if target == "google":
+            self.hub.connect_google_async()
+            return "Opening Google sign-in in your browser..."
+        if target in ("microsoft", "ms", "outlook"):
+            self.hub.connect_microsoft_async()
+            return "Opening Microsoft sign-in in your browser..."
+        return "Usage: !connect google | !connect microsoft"
+    
+    def _bang_mail(self, arg: str) -> str:
+        parts = [p.strip() for p in arg.split("|")]
+        if len(parts) < 4:
+            return "Usage: !mail gmail|microsoft | to@email.com | Subject | Message body"
+        provider, to_addr, subj, body = parts[0], parts[1], parts[2], "|".join(parts[3:])
+        threading.Thread(
+            target=lambda: self.say(
+                f"Sent email to {to_addr}." if self.hub.send_email_now(provider, to_addr, subj, body)
+                else f"Failed to send via {provider} — check credentials.",
+                expr="happy",
+            ),
+            daemon=True,
+        ).start()
+        return ""
 
     def _bang_profile(self, arg: str) -> str:
         chosen = arg.strip().lower()
@@ -1104,6 +1151,7 @@ class Mish:
         """Gracefully stop background loops, flush memory, and unload GGUF weights."""
         if self.stop_event.is_set():
             return
+        self.hub.shutdown()
         self.stop_event.set()
         try:
             self.store.save()
@@ -1174,6 +1222,10 @@ class Mish:
     # ---- background loops ----------------------------------------------------------------------
     def startup_briefing(self):
         time.sleep(1)
+        self.hub.start()
+        if not ENABLE_LLM:
+            self.say("Automation hub online. Deadlines & alerts active.", expr="happy")
+            return
         with self.busy():
             self.brain.load()
         if self.brain.mode:
@@ -1181,7 +1233,6 @@ class Mish:
                 self.say(self.generate("startup"), expr="happy")
         else:
             self.say("No brain loaded. Put a .gguf in the models folder (see Mish.log).", expr="sad")
-
     def hardware_loop(self):
         while not self.stop_event.wait(HW_POLL_S):
             try:
@@ -1323,7 +1374,7 @@ GLYPHS = {
 # sl = eyelid tilt (+ angry, - sad), arc = happy "^" eye, ring = hollow eye with pupil, gx/gy = gaze bias.
 PARAM_DEFAULTS = dict(
     top_l=0.0, top_r=0.0, bot_l=0.0, bot_r=0.0, sl_l=0.0, sl_r=0.0,
-    arc_l=0.0, arc_r=0.0, amp=3.6, ring=0.0, gx=0.0, gy=0.0,
+    arc_l=0.0, arc_r=0.0, amp=3.6, ring=0.0, gx=0.0, gy=0.0, h=1.0,
 )
 
 
@@ -1337,11 +1388,11 @@ EXPRESSIONS = {
     "smug":      dict(top=2.6, bot=0.6, slant=0.8, gx=1.5, color=C_PURPLE, wander=0.15, look=0.5),
     "squint":    dict(top=3.6, bot=3.4, slant=0.6, color=C_CYAN, scan=(3.0, 0.8), wander=0.0, look=0.0, blink=0.5),
     "curious":   dict(top_l=2.4, sl_l=0.9, bot_l=0.5, gy=-1.0, color=C_CYAN, wander=0.3, emote="?"),
-    "surprised": dict(ring=1.0, color=C_CYAN, wander=0.0, look=0.4, emote="!"),
+    "surprised": dict(ring=1.0, h=1.12, color=C_CYAN, wander=0.0, look=0.4, emote="!"),
     "sad":       dict(top=1.2, slant=-2.4, gy=1.5, color=C_BLUE, wander=0.3, look=0.2, blink=0.6),
     "angry":     dict(top=1.6, slant=2.6, color=C_RED, wander=0.1, look=1.0, emote="!", blink=0.4),
     "bored":     dict(top=4.0, bot=1.0, color=C_DIM, wander=0.5, look=0.3, blink=0.4),
-    "sleepy":    dict(top=3.4, bot=2.0, slant=-0.4, color=C_DIM, wander=0.2, look=0.2, blink=0.3),
+    "sleepy":    dict(top=4.6, bot=1.4, slant=-0.5, h=0.94, color=C_DIM, wander=0.2, look=0.2, blink=0.3),
     "thinking":  dict(top=1.0, gy=-2.0, color=C_AMBER, scan=(2.5, 1.5), wander=0.0, look=0.0),
     "focus":     dict(top=1.6, bot=0.6, slant=1.0, color=C_GREEN, wander=0.25, look=0.4, blink=0.5),
     "listening": dict(gy=2.2, color=C_CYAN, wander=0.0, look=0.0),
@@ -1368,6 +1419,14 @@ def _targets(ex: dict) -> dict:
 
 _TARGETS = {name: _targets(ex) for name, ex in EXPRESSIONS.items()}
 _COLORS = {name: _hex_rgb(ex["color"]) for name, ex in EXPRESSIONS.items()}
+
+
+STATE_RGB = {                                     # state-driven eye colours (idle / neutral use the user's accent)
+    "thinking": (245, 158, 11), "curious": (168, 85, 247),
+    "happy": (16, 185, 129), "laugh": (16, 185, 129),
+    "scared": (244, 63, 94), "angry": (244, 63, 94), "dizzy": (244, 63, 94),
+    "sleepy": (99, 102, 241),
+}
 
 
 # What he says picks his face. First matching rule wins.
@@ -1410,6 +1469,7 @@ class EyeEngine:
     Call update() then cells() once per frame."""
 
     FLOURISH = ["happy", "curious", "squint", "wink", "smug", "happy", "curious"]
+    STIFFNESS, DAMPING = 170.0, 14.5                 # damping ratio ~0.55: slight overshoot, then settles
 
     def __init__(self):
         now = time.time()
@@ -1422,6 +1482,7 @@ class EyeEngine:
         self.temp, self.temp_until = "idle", 0.0
         self.last_t = now
         self.gaze = [0.0, 0.0]
+        self.vel = [0.0, 0.0]                        # gaze spring velocity
         self.goal = [0.0, 0.0]
         self.next_saccade = now + 1.0
         self.next_blink = now + 2.0
@@ -1483,16 +1544,23 @@ class EyeEngine:
         self.emote, self.emote_until = em, (now + 1.8 if em else 0.0)
 
     def _goal_color(self, name: str):
-        """The user's eye colour replaces the default cyan; mood colours (red, amber...) stay unless turned off."""
+        """Idle/neutral = the user's accent. Mood states use STATE_RGB. 'thinking' pulses amber <-> violet."""
         base = self.base_rgb
         ex_col = EXPRESSIONS[name]["color"]
         if name == "strike":
             return _COLORS["strike"]
         if name == "asleep":
             return _mix(_mix(base, (102, 136, 170), 0.6), (0, 0, 0), 0.1)
+        if not self.mood:
+            return _mix(base, (0, 0, 0), 0.4) if ex_col == C_DIM else base
+        if name == "thinking":
+            u = 0.5 + 0.5 * math.sin(time.time() * 2.4)
+            return _mix(STATE_RGB["thinking"], STATE_RGB["curious"], 0.65 * u)
+        if name in STATE_RGB:
+            return STATE_RGB[name]
         if ex_col == C_DIM:
             return _mix(base, (0, 0, 0), 0.4)
-        if not self.mood or ex_col == C_CYAN:
+        if ex_col == C_CYAN:
             return base
         return _COLORS[name]
 
@@ -1562,9 +1630,11 @@ class EyeEngine:
                         [random.uniform(-3.2, 3.2), random.uniform(-2.2, 2.2)]
                     self.next_saccade = now + random.uniform(1.0, 3.8) / wander
                 tx, ty = self.goal
-        k = 1 - math.exp(-dt * (22 if following else 14))
-        self.gaze[0] += (tx - self.gaze[0]) * k
-        self.gaze[1] += (ty - self.gaze[1]) * k
+        dt = min(dt, 0.04)                                          # keeps the explicit integrator stable
+        for i, goal in enumerate((tx, ty)):                         # 2D damped harmonic spring
+            acc = self.STIFFNESS * (goal - self.gaze[i]) - self.DAMPING * self.vel[i]
+            self.vel[i] += acc * dt
+            self.gaze[i] = clamp(self.gaze[i] + self.vel[i] * dt, -5.0, 5.0)
 
     # ---- drawing -----------------------------------------------------------------------
     def cells(self, now: float) -> dict:
@@ -1659,8 +1729,8 @@ class EyeEngine:
 
 # ---- appearance + shortcuts, saved to Documents/Mish/settings.json ----------------------
 EYE_PRESETS = [
-    ("Cyan", "#00e6ff"), ("Pink", "#ff7ac8"), ("Green", "#5dffb0"), ("Lime", "#b8ff3d"),
-    ("Orange", "#ff9a3d"), ("Red", "#ff4d5e"), ("Purple", "#b388ff"), ("White", "#f2f2f2"),
+    ("White", "#ffffff"), ("Cyan", "#00e6ff"), ("Emerald", "#34d399"),
+    ("Amber", "#fbbf24"), ("Rose", "#fb7185"), ("Violet", "#a78bfa"),
 ]
 
 
@@ -1676,8 +1746,8 @@ EXE_RE = re.compile(r"[a-z0-9._ -]{1,40}")
 
 
 class Settings:
-    DEFAULTS = dict(eye=C_CYAN, bg="#08080a", shape="round", mood=True, opacity=0.95, apps=None, heavy=None,
-                    profile="general")
+    DEFAULTS = dict(eye="#ffffff", bg="#08080a", shape="pill", mood=True, opacity=0.95, apps=None, heavy=None,
+                    profile="general", theme="auto")
 
     @classmethod
     def fresh(cls) -> dict:
@@ -1693,6 +1763,8 @@ class Settings:
 
     @staticmethod
     def _clean(key, v):
+        if key == "theme":
+            return v if v in ("auto", "dark", "light") else None
         """A safe value, or None if invalid (a bad settings file must never break startup)."""
         if key in ("eye", "bg"):
             ok = isinstance(v, str) and HEX_RE.match(v) and v.lower() != "#000001"   # #000001 = window chroma key
