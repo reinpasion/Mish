@@ -1,24 +1,24 @@
 # Mish
 
-An offline-capable AI desktop buddy that lives **right on your Windows screen**. Powered by a local language model (`SmolLM2-1.7B-Instruct` via `llama.cpp`) running directly on your PC, Mish can read what is on your screen, remember your tasks and deadlines, react to your work habits, and chat with you without sending your data to the cloud.
+An offline-capable AI desktop buddy that lives **right on your Windows screen**. Powered by a local GGUF language model (`llama-cpp-python`, with optional Ollama vision for screen reading), Mish watches your active windows, manages your tasks and focus timers, auto-manages RAM when heavy apps launch, and chats with you locally on your own PC.
 
 ## What makes Mish different
 
-- **Local AI brain:** Runs a quantized GGUF model (`SmolLM2-1.7B-Instruct`) right on your own hardware for private, offline conversations—with built-in personality lines as instant fallback
-- **Screen awareness:** Can read and understand what you are currently working on to give relevant comments, nudges, or help
-- **Alive & autonomous:** Has his own mood, energy, focus/break timers, idle behaviors, and expressive eyes that follow your cursor and react to how you interact with him
-- **Personal memory & tasks:** Remembers your to-do list (`Active Tasks`) locally and syncs school/work deadlines from **Blackboard**, **Google** (Calendar + Gmail), and **Microsoft** (Outlook + To Do)
-- **Lives on your desktop:** Sits as a compact dark rounded face that can float anywhere or tuck into the top-center edge of your screen when you need him out of the way
+- **Local dual-brain AI:** Loads a `main` GGUF model on your PC and automatically switches to a smaller `lite` model (or unloads to save RAM) when you open heavy apps, run low on memory, or step away from your keyboard
+- **Screen & window awareness:** Tracks your active window title/app against your chosen focus profile, gives random screen glances (`look` / `observe`), and can inspect your screen via an optional local vision model
+- **Errand runner & file reader:** Can open apps for you (even searching the Windows Start menu when needed) and read/summarize files dropped onto him (`!read`) or copied to your clipboard
+- **Personal memory & tasks:** Remembers facts (`remember ...`) and keeps a local to-do list (`Active Tasks`) with due-date nudges, plus automatic syncing from **Blackboard**, **Google** (Calendar + Gmail), and **Microsoft** (Outlook + To Do)
+- **Alive on your desktop:** Sits as a compact dark rounded face with expressive eyes that follow your cursor, react to your mood/activity, and tuck neatly into the top-center edge of your screen when you need him out of the way
 
 ## The PC it runs on
 
-Built and tested on Windows. Mish is designed to stay lightweight enough to run alongside your browser, code editor, or games on a regular laptop or desktop.
+Built and tested on Windows. Mish automatically monitors CPU and free RAM so he stays out of the way when you open games, IDEs, or heavy software.
 
 ### Minimum specs you need
 
 - Any Windows 10 or Windows 11 PC (64-bit)
 - Python 3.10 or newer
-- 8 GB of RAM recommended when running the local GGUF AI model (4 GB works if running without a local model)
+- 8 GB of RAM recommended when running local `.gguf` AI models (4 GB works using the `lite` profile or without a local model)
 - Internet only for the initial package install and optional Blackboard, Google, or Microsoft syncing
 
 ## What is in this folder
@@ -26,37 +26,41 @@ Built and tested on Windows. Mish is designed to stay lightweight enough to run 
 | File / Folder | What it is |
 |---|---|
 | `mish.pyw` | The main file you double-click or run to start Mish (no black terminal window) |
-| `mish/brain.py` | Mish's core intelligence: local LLM connection, screen context, mood, timers, and replies |
+| `mish/brain.py` | Mish's core logic: local GGUF loader, auto RAM/CPU model swapping, screen vision, timers, and command parser |
 | `mish/ui.py` | Draws Mish's face, eyes, animations, speech bubbles, and pop-up panels |
 | `mish/eyes.py` | Controls eye movement, blinking, and expressions |
-| `mish/config.py` | Stores Light/Dark theme colors, model settings, and user preferences |
-| `mish/store.py` | Saves your local memory, tasks, and settings |
-| `mish/win_utils.py` | Handles Windows screen capture/reading, screen edges, and multi-monitor positioning |
+| `mish/config.py` | Stores theme colors, focus profiles, model rules, and prompts |
+| `mish/store.py` | Saves your local memory, tasks, usage stats, and settings |
+| `mish/win_utils.py` | Handles Windows screen capture, active window detection, clipboard, and app launching |
 | `mish/integrations/blackboard.py` | Pulls deadlines from your Blackboard calendar link |
 | `mish/integrations/google_sync.py` | Connects Google Calendar and Gmail |
 | `mish/integrations/microsoft_sync.py` | Connects Outlook and Microsoft To Do |
-| `mish/integrations/scheduler.py` | Runs background checks so Mish never freezes |
+| `mish/integrations/scheduler.py` | Runs background sync jobs so Mish never freezes |
 
-Local AI model weights (`.gguf`), personal memory (`memory.json`), and account tokens are **not** included in this folder.
+Local `.gguf` model files are not stored in this GitHub repo because of file size. Download Mish's fine-tuned model weights from Hugging Face: **[reiHien/MishV6](https://huggingface.co/reiHien/MishV6/tree/main)**
+
+Personal memory (`memory.json`) and account tokens are also **not** included in this folder.
 
 ## How to set it up
 
 1. Download or clone this folder onto your PC.
-2. Open **PowerShell** inside the `Mish` folder and install the required packages:
+2. Download the `.gguf` model file(s) from **[Hugging Face (`reiHien/MishV6`)](https://huggingface.co/reiHien/MishV6/tree/main)** and place them inside the `models/` folder. *(If you put two `.gguf` files in `models/`, Mish automatically uses the larger one as `main` and the smaller one as `lite`.)*
+3. Open **PowerShell** inside the `Mish` folder and install the required packages:
    ```powershell
-   pip install pillow apscheduler sqlalchemy
+   pip install pillow psutil plyer apscheduler sqlalchemy llama-cpp-python
    ```
-   *(Install `llama-cpp-python` and place your `.gguf` model in `models/` if using local AI chat.)*
-3. Start Mish:
+4. Start Mish:
    - **Normal mode (no console window):** Double-click `mish.pyw`
    - **With debug logs:** Run `python -u mish.pyw` in PowerShell
 
 ## How to use Mish
 
-- **Chat with him:** Right-click Mish and open the chat/command bar to ask questions or give commands.
+- **Chat or run commands:** Right-click Mish and open the chat box to talk or type commands.
+- **Drop a file on him:** Drag and drop any supported file onto Mish (or use `!read`) so he can inspect and summarize it.
 - **Move him:** Click and drag his dark body anywhere on your screen.
 - **Tuck him away:** Drag him to the **top-center** of your monitor to dock him into a compact top tab. Pull down on the tab to pop him back out.
 - **Open menus:** Right-click Mish (or click the small gear icon when hovering over him) to open **Active Tasks**, **Connections**, or **Customize**.
+- **Close any window:** Click `✕` in the top-right corner or press `Esc`.
 
 ## Commands
 
@@ -84,7 +88,22 @@ Mish supports both **`!` system/tool commands** (which work even if his AI brain
 | `!clean` | Clears saved chat history and empties `Mish.log` (keeps tasks and facts safe) |
 | `!time` / `!ver` | Shows current time/day or Mish's version and active profile |
 
+### Plain-Text Commands
+
+| Category | Examples you can type |
+|---|---|
+| **Tasks** | `tasks`, `add finish lab report by friday`, `done 1`, `delete 2` |
+| **Memory** | `facts`, `remember my exam is at 9am`, `forget 1` |
+| **Focus Timer** | `focus 25`, `pomo 25 5`, `pause focus`, `resume focus`, `stop focus` |
+| **Screen & Clipboard** | `look`, `look what is this error?`, `observe on`, `observe off`, `summarize clipboard` |
+| **Stats & Help** | `stats`, `today`, `help` |
+
+## What to expect & known quirks
+
+- **He can be a bit stupid sometimes:** Mish runs a tiny local model so he stays fast and lightweight on normal laptops. Expect occasional goofy answers, misunderstood context, or confidently wrong guesses—use `!clean` if his chat history gets messy.
+- **Bugs & rough edges:** Mish is an active personal project. If a window acts weird, a command hiccups, or something breaks, check `Mish.log` in your Mish data folder (`Documents\Mish\Mish.log`) and feel free to open an **Issue** on this GitHub repo with what happened and the log snippet.
+
 ## A reminder
 
-- Your screen captures, chat prompts, tasks, and tokens stay **only on your own computer**.
-- Never upload your personal `credentials.json`, tokens, `memory.json`, or large `.gguf` model files if you share your folder online.
+- Your screen captures, clipboard reads, chat history, tasks, and tokens stay **only on your own computer**.
+- Never upload your personal `credentials.json`, tokens, `memory.json`, `settings.json`, or large `.gguf` model files if you share your folder online.
