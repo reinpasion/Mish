@@ -1156,7 +1156,10 @@ class _HudPanel(tk.Toplevel):
         self._build(self.body)
         self._fit()
         self.bind("<Escape>", lambda e: self.destroy())
+        self.body.bind("<Configure>", lambda _e: self._fit(), add="+")
         self.deiconify()
+        self._fit()
+        self.after_idle(self._fit)
         self.focus_force()
 
     # ---- palette / sizing / rebuild ----
@@ -1211,7 +1214,7 @@ class _HudPanel(tk.Toplevel):
         head.pack(fill="x", padx=14, pady=(12, 8))
         lbl = tk.Label(head, text=title, bg=c["bg"], fg=c["accent"], font=("Consolas", 9, "bold"), anchor="w")
         lbl.pack(side="left")
-        close = tk.Label(head, text="âœ•", bg=c["bg"], fg=c["muted"], cursor="hand2", font=("Segoe UI", 10))
+        close = tk.Label(head, text="\u2715", bg=c["bg"], fg=c["muted"], cursor="hand2", font=("Segoe UI", 10))
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: self.destroy())
         close.bind("<Enter>", lambda e: close.configure(fg=c["rose"]))
@@ -1256,7 +1259,7 @@ class _HudPanel(tk.Toplevel):
 class TaskPanel(_HudPanel):
     """Active tasks (local only). Reads/writes the same memory.json as Mish and polls it every second."""
     LIST_H = 250
-    HINT = "call mum at 6pm  |  stretch in 30m  |  gym tomorrow"
+    HINT = ""
 
     def __init__(self, face):
         self.store, self._sig = face.mish.store, None
@@ -1284,7 +1287,7 @@ class TaskPanel(_HudPanel):
         well.configure(bg=c["bg"])
         well.pack(side="left", fill="x", expand=True)
         self.status = tk.Label(body, text=self.HINT, bg=c["bg"], fg=c["muted"], font=("Segoe UI", 8), anchor="w")
-        self.status.pack(fill="x", padx=16, pady=(6, 8))
+        self.status.pack(fill="x", padx=16, pady=(2, 4))
         self.entry.bind("<Return>", self.add)
 
         card = self._card(body, pady=(0, 14))
@@ -1353,7 +1356,7 @@ class TaskPanel(_HudPanel):
         row.pack(fill="x", pady=1)
         chk = CheckCircle(row, lambda t=task: self.finish(t), self.face.theme, self.face.eye_col, size=20, bg=c["card"])
         chk.pack(side="left", padx=(6, 6), pady=8)
-        rm = tk.Label(row, text="âœ•", bg=c["card"], fg=c["card"], cursor="hand2", font=("Segoe UI", 10), padx=8)
+        rm = tk.Label(row, text="\u2715", bg=c["card"], fg=c["card"], cursor="hand2", font=("Segoe UI", 10), padx=8)
         rm.pack(side="right")
         info = tk.Frame(row, bg=c["card"])
         info.pack(side="left", fill="x", expand=True, pady=5)
@@ -1443,7 +1446,7 @@ class CustomizeStudio(_HudPanel):
         self.mood_sw.pack(side="right")
 
         foot = tk.Frame(body, bg=c["bg"])
-        foot.pack(fill="x", padx=14, pady=(2, 14))
+        foot.pack(fill="x", padx=14, pady=(4, 20))
         PillButton(foot, "Reset", self._reset, th, acc, height=28, bg=c["bg"]).pack(side="left")
         PillButton(foot, "Done", self.destroy, th, acc, kind="primary", height=28, bg=c["bg"]).pack(side="right")
 
@@ -1613,26 +1616,26 @@ class ConnectionsPanel(_HudPanel):
         try:
             c, st = self.c, self.hub.status()
             if st["bb_connected"]:
-                self.bb_badge.configure(text=f"â— LINKED ({st['bb_count']})", fg=c["green"])
+                self.bb_badge.configure(text=f"\u25cf LINKED ({st['bb_count']})", fg=c["green"])
             else:
-                self.bb_badge.configure(text="â—‹ NOT SET", fg=c["muted"])
+                self.bb_badge.configure(text="\u25cb NOT SET", fg=c["muted"])
             if st["google_connected"]:
-                self.g_badge.configure(text="â— CONNECTED", fg=c["green"])
+                self.g_badge.configure(text="\u25cf CONNECTED", fg=c["green"])
                 self._btn_state(self.g_btn, "Disconnect", "danger")
             elif st["google_has_creds"]:
-                self.g_badge.configure(text="â— READY TO SIGN IN", fg=c["amber"])
+                self.g_badge.configure(text="\u25cf READY TO SIGN IN", fg=c["amber"])
                 self._btn_state(self.g_btn, "Connect", "primary")
             else:
-                self.g_badge.configure(text="â—‹ NO CREDENTIALS.JSON", fg=c["muted"])
+                self.g_badge.configure(text="\u25cb NO CREDENTIALS.JSON", fg=c["muted"])
                 self._btn_state(self.g_btn, "Connect", "secondary")
             if st["ms_connected"]:
-                self.ms_badge.configure(text="â— CONNECTED", fg=c["green"])
+                self.ms_badge.configure(text="\u25cf CONNECTED", fg=c["green"])
                 self._btn_state(self.ms_btn, "Disconnect", "danger")
             elif st["ms_client_id"]:
-                self.ms_badge.configure(text="â— READY TO SIGN IN", fg=c["amber"])
+                self.ms_badge.configure(text="\u25cf READY TO SIGN IN", fg=c["amber"])
                 self._btn_state(self.ms_btn, "Connect", "primary")
             else:
-                self.ms_badge.configure(text="â—‹ NO CLIENT ID", fg=c["muted"])
+                self.ms_badge.configure(text="\u25cb NO CLIENT ID", fg=c["muted"])
                 self._btn_state(self.ms_btn, "Connect", "primary")
         except tk.TclError:
             pass
