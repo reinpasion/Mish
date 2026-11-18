@@ -46,8 +46,9 @@ Personal memory (`memory.json`) and account tokens are also **not** included in 
 1. Download or clone this folder onto your PC.
 2. Download the `.gguf` model file(s) from **[Hugging Face (`reiHien/MishV6`)](https://huggingface.co/reiHien/MishV6/tree/main)** and place them inside the `models/` folder. *(If you put two `.gguf` files in `models/`, Mish automatically uses the larger one as `main` and the smaller one as `lite`.)*
 3. Open **PowerShell** inside the `Mish` folder and install the required packages:
-   ```powershell
-   pip install pillow psutil plyer apscheduler sqlalchemy llama-cpp-python
+```powershell
+   pip install pillow psutil plyer apscheduler sqlalchemy icalendar requests google-api-python-client google-auth-httplib2 google-auth-oauthlib msal
+   pip install llama-cpp-python --only-binary=llama-cpp-python --extra-index-url [https://abetlen.github.io/llama-cpp-python/whl/cpu](https://abetlen.github.io/llama-cpp-python/whl/cpu)
    ```
 4. Start Mish:
    - **Normal mode (no console window):** Double-click `mish.pyw`
