@@ -104,13 +104,6 @@ Mish supports both **`!` system/tool commands** (which work even if his AI brain
 - **He can be a bit stupid sometimes:** Mish runs a tiny local model so he stays fast and lightweight on normal laptops. Expect occasional goofy answers, misunderstood context, or confidently wrong guesses—use `!clean` if his chat history gets messy.
 - **Bugs & rough edges:** Mish is an active personal project. If a window acts weird, a command hiccups, or something breaks, check `Mish.log` in your Mish data folder (`Documents\Mish\Mish.log`) and feel free to open an **Issue** on this GitHub repo with what happened and the log snippet.
 
-## Version History
-
-Mish follows an **`x.y.za`** versioning format:
-- **`x`** = Major milestone / full architecture overhaul
-- **`y`** = Major feature release
-- **`z`** = Small feature additions
-- **`a`** = Bug fixes & small tweaks
 
 ### Released Versions
 
