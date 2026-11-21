@@ -2201,7 +2201,7 @@ class RobotFaceWindow:
             except tk.TclError:
                 pass
         if self.mish.strike_mode:
-            self.mish.react_async("strike_chat", extra="they tried to open the chat box", force=True)
+            self.mish.react_async("strike_chat", extra="they tried to open the chat box")
             return
         dlg = self._chat_dlg = tk.Toplevel(self.root)
         dlg.configure(bg=self.bg)
@@ -2244,7 +2244,7 @@ class RobotFaceWindow:
         def on_drop(files):
             paths = [f.decode("utf-8", "replace") if isinstance(f, bytes) else str(f) for f in files]
             self.eyes.set_expression("curious", 1.2)
-            self.mish.handle_files(paths)
+            self.mish.handle_files(paths, use_llm=False)
         try:
             windnd.hook_dropfiles(self.root, func=on_drop, force_unicode=True)
         except Exception as e:
@@ -2324,7 +2324,7 @@ class RobotFaceWindow:
             self.is_scared = True
             if self.edge_hold_start == 0.0:
                 self.edge_hold_start = now
-                self.mish.react_async("scared", force=True)
+                self.mish.react_async("scared")
             elif now - self.edge_hold_start > 6.0:
                 self.trigger_strike_mode()
         else:
@@ -2333,7 +2333,7 @@ class RobotFaceWindow:
 
         if self.mish.strike_mode and now > self.strike_until:
             self.mish.strike_mode = False
-            self.mish.react_async("strike_end", force=True)
+            self.mish.react_async("strike_end")
 
     def snap_to_center_punish(self, window_name: str):
         """Focus mode: jump to the middle of the screen and demand that the distraction be closed."""
@@ -2346,7 +2346,7 @@ class RobotFaceWindow:
 
     def trigger_dizzy_state(self):
         self.is_dizzy = True
-        self.mish.react_async("dizzy", force=True)
+        self.mish.react_async("dizzy")
 
         def recover():
             time.sleep(3.0)
@@ -2358,7 +2358,7 @@ class RobotFaceWindow:
         self.is_scared = False
         self.mish.strike_mode = True
         self.strike_until = time.time() + 60.0
-        self.mish.react_async("strike_start", force=True)
+        self.mish.react_async("strike_start")
 
     def animate_loop(self):
         try:
@@ -3378,7 +3378,7 @@ class LayeredMishWindow(RobotFaceWindow):
             self.is_scared = True
             if self.edge_hold_start == 0.0:
                 self.edge_hold_start = now
-                self.mish.react_async("scared", force=True)
+                self.mish.react_async("scared")
             elif now - self.edge_hold_start > 6.0:
                 self.trigger_strike_mode()
         else:
@@ -3386,7 +3386,7 @@ class LayeredMishWindow(RobotFaceWindow):
             self.edge_hold_start = 0.0
         if self.mish.strike_mode and now > self.strike_until:
             self.mish.strike_mode = False
-            self.mish.react_async("strike_end", force=True)
+            self.mish.react_async("strike_end")
 
 
 
@@ -3435,7 +3435,7 @@ class LayeredMishWindow(RobotFaceWindow):
             except tk.TclError:
                 pass
         if self.mish.strike_mode:
-            self.mish.react_async("strike_chat", extra="they tried to open the chat box", force=True)
+            self.mish.react_async("strike_chat", extra="they tried to open the chat box")
             return
         th = self.theme
         c = ui_colors(th, self.eye_col)
@@ -3634,8 +3634,9 @@ def ensure_portable_setup(base_dir: Path):
         readme.write_text(
             "Mish Local Models Folder\n"
             "========================\n"
-            "Drop your quantized .gguf model files here (e.g. SmolLM2-1.7B-Instruct-Q4_K_M.gguf).\n"
-            "Mish will automatically detect and load them on startup.\n"
+            "Place one quantized .gguf model here, such as reiHien/MishV6.\n"
+            "Auto loads it for chat, file analysis, or clipboard summaries.\n"
+            "Use !brain on to keep it loaded, !brain off to unload it, or !brain auto to restore on-demand loading.\n"
             "Press Alt+M anytime to summon Mish!\n",
             encoding="utf-8",
         )

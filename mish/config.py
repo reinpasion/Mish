@@ -25,12 +25,10 @@ DATA_DIR = user_data_dir()
 
 
 # ---- brain ----
-ENABLE_LLM = False               # False = zero local GGUF RAM usage (automation + Ghost HUD only)
-MODEL_GLOB = "*.gguf"            # any .gguf in a "models" folder (biggest = main, smallest = lite)
+BRAIN_CTX = 1536
+MODEL_GLOB = "*.gguf"
 
 
-MODEL_NAME = "gemma3:1b"         # only used if the local model fails and Ollama is installed
-KEEP_ALIVE = "30m"               # Ollama fallback only
 VISION_MODEL = "moondream"       # screen vision needs Ollama; off in the standalone build
 VISION_KEEP_ALIVE = "5m"
 
@@ -40,9 +38,9 @@ REACTION_COOLDOWN = 45           # seconds between window-switch reactions
 
 
 AMBIENT_MIN_GAP = 90             # minimum seconds between any unsolicited popups
-BRAIN_IDLE_UNLOAD_S = 15 * 60    # unload main brain to RAM after 15m idle
-__version__ = "0.5.41"
-DEFAULT_SETTINGS = {"dev": 0}        # 1 = Dev Console auto-opens and fast timers are on
+BRAIN_IDLE_UNLOAD_S = 15 * 60    # release the auto-mode GGUF after 15m idle
+__version__ = "0.5.50a"
+DEFAULT_SETTINGS = {"dev": 0, "brain_mode": "auto"}
 HOTKEY_MOD = 0x0001 | 0x4000     # MOD_ALT | MOD_NOREPEAT
 HOTKEY_VK = 0x4D                 # 'M' -> Alt+M global summon
 
@@ -81,14 +79,13 @@ FACT_LIMIT = 20                  # facts kept, strongest first
 FACT_PROMPT_MIN = 2.5            # only facts at least this strong go into his prompt
 
 
-# ---- heavy mode / automatic brain swapping ----
-HEAVY_RAM_FREE_GB = 1.2          # less free RAM than this counts as heavy load
+# ---- heavy mode / automatic brain unloading ----
+HEAVY_RAM_PCT = 85               # sustained system RAM usage that counts as heavy load
 
 
 HEAVY_CPU = 90                   # sustained CPU % (outside his own thinking) that counts as heavy load
-HEAVY_ENTER_S = 8                # heavy load must last this long before he shrinks
-HEAVY_EXIT_S = 25                # and it must be calm this long before he grows back
-SWAP_MIN_GAP = 45                # never swap more often than this
+HEAVY_ENTER_S = 8                # sustained pressure before unloading
+HEAVY_EXIT_S = 25                # sustained calm before auto can load again
 HW_POLL_S = 3
 DEFAULT_HEAVY = ["", ""]            # edit with !heavy add / remove
 AMBIENT_EVENTS = {"observe", "reminder", "slacking", "switch", "pester", "wake"}   # muted in heavy mode
@@ -102,16 +99,12 @@ ANNOY_DONE_REWARD = 25           # -annoyance when a task is completed
 SLACK_STREAK_S = 90              # continuous seconds on a slack category before it starts annoying him
 FOCUS_SLACK_STREAK_S = 15        # same, but during focus mode
 SLACK_BUMP_GAP = 45              # min seconds between two slack bumps
-SCOLD_LLM_GAP = 120              # at fed_up: at most one LLM-written scolding per this many seconds
-CANNED_FIRST_EVENTS = {"switch", "slacking", "gaming", "nag", "pester"}
-CANNED_ONLY_EVENTS = {"observe", "wake", "reminder", "focus_punish", "focus_done", "heavy_end"}
 DEV_SLACK_STREAK_S = 5
 DEV_FOCUS_SLACK_STREAK_S = 3
 DEV_SLACK_BUMP_GAP = 5
 DEV_REACTION_COOLDOWN = 5
 DEV_AMBIENT_MIN_GAP = 5
 DEV_WINDOW_SWITCH_CHANCE = 1.0
-QUIET_EVENTS = {"poke"}          # generated without showing the "thinking" eyes
 
 
 # ---- app keywords ----
@@ -174,36 +167,11 @@ OPEN_RULE = (
 
 
 EVENT_INSTRUCTIONS = {
-    "observe": "You just glanced at the user's screen: {seen}. Comment on it in a nosy, needling way.",
-    "reminder": "Pester the user about ONE specific pending task from the list.",
-    "slacking": "The user is distracted by '{window}'. Nag them about it, smug and clingy.",
-    "switch": "The user just switched to '{window}'. Make a nosy, needling remark about it.",
     "chat": "Reply to the user's message. Actually answer or help with what they asked, but with some sass "
             "(tease, nitpick, or add a nosy follow-up). Connect it to the chat history when relevant.",
-    "pester": "Interrupt the user with an unsolicited, cheeky remark or a nosy question. Base it on the context. "
-              "Do not say that you are interrupting.",
-    "nag": "A task just came due: {extra}. Nag the user about it.",
-    "startup": "You just booted up on the user's PC. Greet them in a cheeky, needling way.",
-    "wake": "You were asleep and the user just came back and woke you up. Complain, or nosily ask where they went.",
-    "poke": "The user just poked (clicked) you, {extra}. React to being poked, but do not repeat the numbers.",
-    "scared": "The user dragged you to the very edge of the screen and you are terrified of falling off. "
-              "Panic dramatically and demand to be moved back.",
-    "dizzy": "The user is shaking you violently and you are dizzy. Complain about it.",
-    "strike_start": "You were left at the screen edge for too long. Announce that you are on strike and refuse "
-                    "to talk to the user for 60 seconds.",
-    "strike_end": "Your 60-second silent treatment just ended. Come back grudgingly, still petty.",
-    "strike_chat": "You are giving the user the silent treatment and refuse to help right now. The user is trying "
-                   "to talk to you: {extra}. Give a short, icy refusal.",
     "file": "The user just dropped a file on you. Facts and an excerpt: {extra}\nReact with one quick, sassy remark "
             "that uses ONLY these facts (name, type, size, syntax check result). If the check found an error, point it "
             "out with the line number. Never invent problems the check did not report.",
-    "heavy_end": "A demanding program the user was running just closed. You had shrunk your brain to save memory "
-                 "while it ran. Comment on it.",
-    "focus_punish": "The user is in focus mode but opened '{window}'. You just teleported to the middle of their "
-                    "screen to stop them. Demand that they close it.",
-    "focus_done": "The user just finished their {extra}. Congratulate them briefly with a tiny bit of sass.",
-    "gaming": "The user has been playing or sitting in '{window}' for a while instead of working. "
-              "Scold them, smug and clingy, and mention their pending work.",
 }
 
 
@@ -226,7 +194,7 @@ HELP_TEXT = """Commands:
   look [question] | watch on|off
   !open <app> | !apps | !alias <name> <path>
   !read <file> (or drop a file on me)
-  !sys | !time | !clean | !brain | !heavy"""
+  !sys | !time | !clean | !brain [on|off|auto] | !heavy"""
 
 
 BANG_HELP = "Commands: !sync, !bb, !connect, !mail, !msid, !open, !apps, !alias, !read, !sys, !time, !clean, !brain, !heavy, !profile, !focus, !clip2task, !ver, !dev"
