@@ -39,18 +39,41 @@ REACTION_COOLDOWN = 45           # seconds between window-switch reactions
 
 AMBIENT_MIN_GAP = 90             # minimum seconds between any unsolicited popups
 BRAIN_IDLE_UNLOAD_S = 15 * 60    # release the auto-mode GGUF after 15m idle
-__version__ = "0.5.50a"
-DEFAULT_SETTINGS = {"dev": 0, "brain_mode": "auto"}
+__version__ = "0.5.50b"
+DEFAULT_SETTINGS = {"dev": 0, "brain_mode": "auto", "profile": "neutral", "profile_auto": 1}
 HOTKEY_MOD = 0x0001 | 0x4000     # MOD_ALT | MOD_NOREPEAT
 HOTKEY_VK = 0x4D                 # 'M' -> Alt+M global summon
 
 
-FOCUS_PROFILES = {
-    "general": {"work_extra": [], "slacking_extra": [], "nag_slacking": True},
-    "student": {"work_extra": ["anki", "notion", "obsidian", "onenote", "acrobat", "zotero", "word", "docs"], "slacking_extra": [], "nag_slacking": True},
-    "dev": {"work_extra": ["code", "pycharm", "terminal", "powershell", "wt", "git", "docker", "cursor"], "slacking_extra": [], "nag_slacking": True},
-    "creative": {"work_extra": ["blender", "photoshop", "premiere", "resolve", "figma", "illustrator", "audacity", "obs"], "slacking_extra": [], "nag_slacking": True},
-    "chill": {"work_extra": [], "slacking_extra": [], "nag_slacking": False},
+PROFILE_NAMES = ("work", "neutral", "chill")
+_PROFILE_CATEGORIES = {"code": "work", "work": "work", "media": "slack", "social": "slack", "game": "slack"}
+PROFILES = {
+    "work": {
+        "categories": _PROFILE_CATEGORIES,
+        "slack_step": 12, "slack_grace_s": 45, "work_decay": 3, "annoy_cap": 100,
+        "muted": frozenset({"switch", "pester"}),
+        "persona": "Be a concise, practical coach. Steer back to the current task when relevant.",
+    },
+    "neutral": {
+        "categories": _PROFILE_CATEGORIES,
+        "slack_step": 8, "slack_grace_s": 90, "work_decay": 2, "annoy_cap": 100,
+        "muted": frozenset(),
+        "persona": "Be a cheeky, balanced desktop companion.",
+    },
+    "chill": {
+        "categories": {**_PROFILE_CATEGORIES, "media": "neutral", "social": "neutral", "game": "neutral"},
+        "slack_step": 0, "slack_grace_s": 0, "work_decay": 2, "annoy_cap": 35,
+        "muted": frozenset({"nag"}),
+        "persona": "Be a relaxed hangout buddy. Never scold about games, media, or open tabs.",
+    },
+}
+
+# Built-in lines for the relaxed profile; user-provided buckets can replace them.
+PROFILE_CANNED_DEFAULTS = {
+    "switch__chill": ["Over to {app}. Nice.", "New window, same good company."],
+    "pester__chill": ["Hey, hope you're having a good time.", "I'm here if you feel like chatting."],
+    "gaming__chill": ["Enjoy the game. I'm cheering for you.", "Have fun in {app}."],
+    "slacking__chill": ["Taking a breather? Enjoy it.", "Hope you're having a good time in {app}."],
 }
 
 
@@ -92,15 +115,10 @@ AMBIENT_EVENTS = {"observe", "reminder", "slacking", "switch", "pester", "wake"}
 ANNOYANCE_START = 15
 MOOD_IRRITATED_AT = 40           # tier "irritated" from here
 MOOD_FED_UP_AT = 80              # tier "fed_up" from here
-ANNOY_SLACK_STEP = 8             # +annoyance per bump while slacking/gaming outside focus
-ANNOY_FOCUS_STEP = 15            # +annoyance per bump while slacking during focus mode
 ANNOY_NAG_STEP = 12              # +annoyance each time a due-task nag fires
 ANNOY_DONE_REWARD = 25           # -annoyance when a task is completed
-SLACK_STREAK_S = 90              # continuous seconds on a slack category before it starts annoying him
-FOCUS_SLACK_STREAK_S = 15        # same, but during focus mode
 SLACK_BUMP_GAP = 45              # min seconds between two slack bumps
 DEV_SLACK_STREAK_S = 5
-DEV_FOCUS_SLACK_STREAK_S = 3
 DEV_SLACK_BUMP_GAP = 5
 DEV_REACTION_COOLDOWN = 5
 DEV_AMBIENT_MIN_GAP = 5
@@ -194,7 +212,8 @@ HELP_TEXT = """Commands:
   look [question] | watch on|off
   !open <app> | !apps | !alias <name> <path>
   !read <file> (or drop a file on me)
-  !sys | !time | !clean | !brain [on|off|auto] | !heavy"""
+  !sys | !time | !clean | !brain [on|off|auto] | !heavy
+  !profile [work|neutral|chill|auto]"""
 
 
 BANG_HELP = "Commands: !sync, !bb, !connect, !mail, !msid, !open, !apps, !alias, !read, !sys, !time, !clean, !brain, !heavy, !profile, !focus, !clip2task, !ver, !dev"

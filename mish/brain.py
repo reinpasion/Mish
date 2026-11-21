@@ -55,7 +55,9 @@ from .config import (
     EVENT_INSTRUCTIONS,
     FACT_PROMPT_MIN,
     FOCUS_DEFAULT_MIN,
-    FOCUS_PROFILES,
+    PROFILE_CANNED_DEFAULTS,
+    PROFILE_NAMES,
+    PROFILES,
     HEAVY_CPU,
     HEAVY_ENTER_S,
     HEAVY_EXIT_S,
@@ -77,12 +79,11 @@ from .config import (
     VISION_KEEP_ALIVE,
     VISION_MODEL,
     WINDOW_SWITCH_CHANCE,
-    ANNOY_DONE_REWARD, ANNOY_FOCUS_STEP, ANNOY_NAG_STEP, ANNOY_SLACK_STEP, ANNOYANCE_START,
-    FOCUS_SLACK_STREAK_S, MOOD_FED_UP_AT, MOOD_IRRITATED_AT,
-    SLACK_BUMP_GAP, SLACK_STREAK_S,
+    ANNOY_DONE_REWARD, ANNOY_NAG_STEP, ANNOYANCE_START,
+    MOOD_FED_UP_AT, MOOD_IRRITATED_AT,
+    SLACK_BUMP_GAP,
     DEFAULT_SETTINGS,
     DEV_AMBIENT_MIN_GAP,
-    DEV_FOCUS_SLACK_STREAK_S,
     DEV_REACTION_COOLDOWN,
     DEV_SLACK_BUMP_GAP,
     DEV_SLACK_STREAK_S,
@@ -109,7 +110,6 @@ from .win_utils import (
     log,
     parse_when,
     classify_detail,
-    detail_to_cat,
     friendly_app_name,
 )
 from .integrations import (
@@ -337,6 +337,7 @@ class Brain:
 
 # 6. MISH (logic)
 OPEN_RE = re.compile(r"\[OPEN:\s*([^\]]+)\]", re.I)
+_PRODUCTIVE_DETAILS = frozenset({"code", "work"})
 
 
 class Mish:
@@ -375,12 +376,15 @@ class Mish:
         self._busy = 0                              # any work he is doing (used for the CPU check)
         self._busy_visible = 0                      # ...of which the user should see as "thinking" eyes
         self._busy_lock = threading.Lock()
-        self.annoyance: int = ANNOYANCE_START      # 0..100
-        self.current_cat: str = "neutral"          # detail category (game/media/social/code/work/neutral)
-        self.cat_streak_s: float = 0.0             # continuous seconds on current_cat
-        self._last_annoyance_decay: float = time.time()
-        self._last_slack_bump = 0.0
         self._mood_lock = threading.RLock()
+        self._pinned_profile = self.settings["profile"]
+        self.profile_auto = bool(self.settings["profile_auto"])
+        self.active_profile = "neutral" if self.profile_auto else self._pinned_profile
+        self._annoyance = ANNOYANCE_START
+        self.current_cat = "neutral"               # raw detail; remains game/media/social even in chill
+        self.cat_streak_s = 0.0
+        self._last_annoyance_decay = time.time()
+        self._last_slack_bump = 0.0
         self.store.on_complete = lambda _t: self._bump_annoyance(-ANNOY_DONE_REWARD)
         self.dev_mode: bool = bool(self.settings.get("dev", 0))
         self._dev_fast_timers: bool = self.dev_mode
@@ -396,12 +400,21 @@ class Mish:
                 try:
                     data = json.loads(p.read_text(encoding="utf-8"))
                     log(f"canned lines loaded: {sum(len(v) for v in data.values())}")
-                    return data
+                    return {**PROFILE_CANNED_DEFAULTS, **data}
                 except Exception as e:
                     log("canned lines failed to load:", repr(e))
-        return {}
+        return dict(PROFILE_CANNED_DEFAULTS)
 
     _PLACEHOLDER_RE = re.compile(r"\{(app|task|due|mins|tier)\}")
+
+    @property
+    def annoyance(self) -> int:
+        with self._mood_lock:
+            return self._annoyance
+
+    @annoyance.setter
+    def annoyance(self, value: int):
+        self._set_annoyance(value)
 
     def _mood_tier(self) -> str:
         a = self.annoyance
@@ -411,8 +424,58 @@ class Mish:
 
     def _bump_annoyance(self, delta: int) -> int:
         with self._mood_lock:
-            self.annoyance = int(clamp(self.annoyance + delta, 0, 100))
-            return self.annoyance
+            return self._set_annoyance(self._annoyance + delta)
+
+    def _profile_mutes(self, event: str) -> bool:
+        with self._mood_lock:
+            return event in PROFILES[self.active_profile]["muted"]
+
+    def _activate_profile_locked(self, profile: str):
+        self.active_profile = profile
+        self._annoyance = min(self._annoyance, PROFILES[profile]["annoy_cap"])
+
+    def _pick_profile_locked(self, now: datetime, task_flags=None) -> str | None:
+        if self.in_focus():
+            return "work"
+        if not self.profile_auto:
+            return self._pinned_profile
+        if self.current_cat == "game":
+            return "chill"
+        working = self.current_cat in _PRODUCTIVE_DETAILS and self.cat_streak_s >= 180
+        late = now.hour >= 23 or now.hour < 5
+        if not (working or late):
+            return "neutral"
+        if task_flags is None:
+            return None
+        has_tasks, due_soon = task_flags
+        if working and has_tasks:
+            return "work"
+        return "chill" if late and not due_soon else "neutral"
+
+    def _refresh_profile(self, now: datetime | None = None):
+        now = now or datetime.now()
+        with self._mood_lock:
+            selection = self._pick_profile_locked(now)
+            if selection is not None:
+                self._activate_profile_locked(selection)
+                return
+
+        tasks = self.store.pending()
+        cutoff = now.timestamp() + 6 * 3600
+        due_soon = False
+        for task in tasks:
+            due = task.get("due")
+            if due:
+                try:
+                    if datetime.fromisoformat(due).timestamp() <= cutoff:
+                        due_soon = True
+                        break
+                except (TypeError, ValueError, OverflowError, OSError):
+                    continue
+        with self._mood_lock:
+            # The focus timer, a manual pin, or the observed app can change during the task lookup.
+            selection = self._pick_profile_locked(now, (bool(tasks), due_soon))
+            self._activate_profile_locked(selection)
 
     # ---- phrase / grammar expander (v0.5.32) ----
     _SLOT_RE = re.compile(r"\[([a-zA-Z0-9_]+)\]")
@@ -459,13 +522,14 @@ class Mish:
 
     def _canned_vars(self, extra: dict | None = None) -> dict:
         """Safe template values for {app}, {task}, {due}, {mins}, and {tier}."""
-        vars_out = {
-            "app": self._live_friendly if getattr(self, "_live_friendly", "(none yet)") != "(none yet)" else "that app",
-            "task": "your task",
-            "due": "soon",
-            "mins": str(max(1, int(round(self.cat_streak_s / 60.0)))),
-            "tier": self._mood_tier().replace("_", " "),
-        }
+        with self._mood_lock:
+            vars_out = {
+                "app": self._live_friendly if self._live_friendly != "(none yet)" else "that app",
+                "task": "your task",
+                "due": "soon",
+                "mins": str(max(1, int(round(self.cat_streak_s / 60.0)))),
+                "tier": self._mood_tier().replace("_", " "),
+            }
         try:
             pending = self.store.pending()
             if pending:
@@ -512,14 +576,23 @@ class Mish:
 
     def _canned(self, event: str, **vars) -> str:
         """Expand templates first, then select and record against the shared history."""
-        tier = self._mood_tier()
-        lines = self.canned.get(f"{event}__{tier}") or self.canned.get(event) or []
-        if isinstance(lines, str):
-            lines = [lines]
-        if not isinstance(lines, list):
-            return ""
-        lines = [line for line in lines if isinstance(line, str) and line.strip()]
-        if not lines:
+        with self._mood_lock:
+            profile, tier = self.active_profile, self._mood_tier()
+        keys = [f"{event}__{profile}"]
+        if tier in ("irritated", "fed_up"):
+            keys.append(f"{event}__{tier}")
+        keys.append(event)
+        if event == "gaming":
+            keys.append("slacking")
+        for key in keys:
+            lines = self.canned.get(key)
+            if isinstance(lines, str):
+                lines = [lines]
+            if isinstance(lines, list):
+                lines = [line for line in lines if isinstance(line, str) and line.strip()]
+                if lines:
+                    break
+        else:
             return ""
 
         live = None
@@ -548,13 +621,14 @@ class Mish:
 
     def _ambient_line(self, event: str, window: str = "", extra: str = "",
                       bypass_cooldown: bool = False) -> str:
-        if self.strike_mode and event not in STRIKE_EVENTS:
+        if self._profile_mutes(event) or (self.strike_mode and event not in STRIKE_EVENTS):
             return ""
         if event in AMBIENT_EVENTS:
             if self.heavy_mode or is_fullscreen_foreground():
                 return ""
-            if not bypass_cooldown and time.time() - self._last_ambient_say < self._ambient_min_gap():
-                return ""
+            with self._mood_lock:
+                if not bypass_cooldown and time.time() - self._last_ambient_say < self._ambient_min_gap():
+                    return ""
         values = {"app": window} if window else {}
         if event == "nag" and extra:
             values["task"] = extra
@@ -562,8 +636,11 @@ class Mish:
         line = self._canned(bucket, **values)
         self._last_prompt = f"(template, no LLM) event={event} tier={self._mood_tier()}\n{line}"
         self._last_gen_ms = 0
-        if line and event in AMBIENT_EVENTS:
-            self._last_ambient_say = time.time()
+        with self._mood_lock:
+            if self._profile_mutes(event):
+                return ""
+            if line and event in AMBIENT_EVENTS:
+                self._last_ambient_say = time.time()
         return line
 
     def remind_now(self):
@@ -582,15 +659,14 @@ class Mish:
                      expr="angry")
 
     # ---- mood updates (called from the watcher thread) ----
-    def _track_streak(self, detail: str, dt: float):
+    def _track_streak(self, detail: str, dt: float, friendly: str):
         with self._mood_lock:
-            if detail == self.current_cat:
-                self.cat_streak_s += dt
-            else:
-                self.current_cat, self.cat_streak_s = detail, 0.0
+            continuous_work = detail in _PRODUCTIVE_DETAILS and self.current_cat in _PRODUCTIVE_DETAILS
+            self.cat_streak_s = self.cat_streak_s + dt if detail == self.current_cat or continuous_work else 0.0
+            self.current_cat, self._live_friendly = detail, friendly
 
     def _mood_decay(self, now: float, cat: str, detail: str):
-        """-1 per calm minute, -2 per minute of continuous work/code. No decay while slacking."""
+        """Decay once per calm minute, with faster recovery during sustained productive work."""
         with self._mood_lock:
             elapsed = now - self._last_annoyance_decay
             if elapsed < 60:
@@ -599,34 +675,39 @@ class Mish:
             self._last_annoyance_decay += periods * 60
             if cat == "slack":
                 return
-            per = 2 if (detail in ("work", "code") and self.current_cat == detail and self.cat_streak_s >= 60) else 1
-            self.annoyance = int(clamp(self.annoyance - per * periods, 0, 100))
+            working = detail in _PRODUCTIVE_DETAILS and self.current_cat in _PRODUCTIVE_DETAILS and self.cat_streak_s >= 60
+            per = PROFILES[self.active_profile]["work_decay"] if working else 1
+            self._bump_annoyance(-per * periods)
 
-    def _slack_streak_need(self, focus: bool) -> float:
-        if self._dev_fast_timers:
-            return DEV_FOCUS_SLACK_STREAK_S if focus else DEV_SLACK_STREAK_S
-        return FOCUS_SLACK_STREAK_S if focus else SLACK_STREAK_S
-
-    def _slack_bump_gap(self) -> float:
-        return DEV_SLACK_BUMP_GAP if self._dev_fast_timers else SLACK_BUMP_GAP
+    def _slack_streak_need(self) -> float:
+        with self._mood_lock:
+            grace = PROFILES[self.active_profile]["slack_grace_s"]
+            if self._dev_fast_timers:
+                grace *= DEV_SLACK_STREAK_S / PROFILES["neutral"]["slack_grace_s"]
+            return grace
 
     def _reaction_cooldown(self) -> float:
-        return DEV_REACTION_COOLDOWN if self._dev_fast_timers else REACTION_COOLDOWN
+        with self._mood_lock:
+            return DEV_REACTION_COOLDOWN if self._dev_fast_timers else REACTION_COOLDOWN
 
     def _ambient_min_gap(self) -> float:
-        return DEV_AMBIENT_MIN_GAP if self._dev_fast_timers else AMBIENT_MIN_GAP
+        with self._mood_lock:
+            return DEV_AMBIENT_MIN_GAP if self._dev_fast_timers else AMBIENT_MIN_GAP
 
     def _switch_chance(self) -> float:
-        return DEV_WINDOW_SWITCH_CHANCE if self._dev_fast_timers else WINDOW_SWITCH_CHANCE
-
-    def _slack_bump(self, now: float, focus: bool) -> bool:
-        need, gap = self._slack_streak_need(focus), self._slack_bump_gap()
         with self._mood_lock:
-            if self.cat_streak_s < need or now - self._last_slack_bump < gap:
+            return DEV_WINDOW_SWITCH_CHANCE if self._dev_fast_timers else WINDOW_SWITCH_CHANCE
+
+    def _slack_bump(self, now: float) -> bool:
+        with self._mood_lock:
+            profile = PROFILES[self.active_profile]
+            if profile["categories"].get(self.current_cat) != "slack":
+                return False
+            gap = DEV_SLACK_BUMP_GAP if self._dev_fast_timers else SLACK_BUMP_GAP
+            if self.cat_streak_s < self._slack_streak_need() or now - self._last_slack_bump < gap:
                 return False
             self._last_slack_bump = now
-            step = ANNOY_FOCUS_STEP if focus else ANNOY_SLACK_STEP
-            self.annoyance = int(clamp(self.annoyance + step, 0, 100))
+            self._bump_annoyance(profile["slack_step"])
             return True
 
     # ---- dev console commands (regex only, no eval) ----
@@ -648,28 +729,33 @@ class Mish:
 
     def _set_annoyance(self, n) -> int:
         with self._mood_lock:
-            self.annoyance = int(clamp(int(n), 0, 100))
-            return self.annoyance
+            self._annoyance = int(clamp(int(n), 0, PROFILES[self.active_profile]["annoy_cap"]))
+            return self._annoyance
 
     def _timers_text(self) -> str:
-        if self._dev_fast_timers:
-            return f"Timers: FAST ({DEV_SLACK_STREAK_S}s streak, {DEV_REACTION_COOLDOWN}s cooldown)"
-        return f"Timers: NORMAL ({SLACK_STREAK_S}s streak, {REACTION_COOLDOWN}s cooldown)"
+        with self._mood_lock:
+            speed = "FAST" if self._dev_fast_timers else "NORMAL"
+            grace, cooldown = self._slack_streak_need(), self._reaction_cooldown()
+        return f"Timers: {speed} ({grace:g}s streak, {cooldown:g}s cooldown)"
 
     def dev_status_text(self) -> str:
-        """Five-line live readout. Read-only, so the Tk thread may call it directly."""
+        """Read-only live telemetry for the Tk thread."""
         now = time.time()
+        with self._mood_lock:
+            mood = f"{self._annoyance}/{PROFILES[self.active_profile]['annoy_cap']} ({self._mood_tier().replace('_', ' ')})"
+            window = f"{self._live_friendly} [{self.current_cat} \u00b7 {int(self.cat_streak_s)}s]"
+            profile = f"{self.active_profile} ({'auto' if self.profile_auto else 'pinned'})"
         return (f"Time: {time.strftime('%H:%M:%S', time.localtime(now))} ({int(now)})\n"
-                f"Annoyance: {self.annoyance}/100 ({self._mood_tier().replace('_', ' ')})\n"
-                f"Window: {self._live_friendly} [{self.current_cat} \u00b7 {int(self.cat_streak_s)}s]\n"
-                f"{self.brain.status_text()}\n"
-                f"{self._timers_text()}")
+                f"Annoyance: {mood}\nWindow: {window}\nProfile: {profile}\n"
+                f"{self.brain.status_text()}\n{self._timers_text()}")
 
     def _dev_fire(self, args: list) -> str:
         event = args[0].lower() if args else ""
         if event not in self._DEV_EVENTS:
             return "Usage: fire(gaming|slacking|nag|switch|pester|focus_punish[, app])"
         window = args[1] if len(args) > 1 else self._DEV_FIRE_APPS.get(event, "")
+        if self._profile_mutes(event):
+            return f"Blocked: {event} is muted in the current profile."
         if self.strike_mode:
             return "Blocked: strike mode is on (only strike lines are allowed)."
         if event in AMBIENT_EVENTS and self.heavy_mode:
@@ -708,13 +794,11 @@ class Mish:
         if name == "fire":
             return self._dev_fire(args)
         if name in ("timers", "toggle_timers"):
-            if args:
-                a = args[0].lower()
-                if a not in ("fast", "normal"):
-                    return "Usage: timers(fast|normal)"
-                self._dev_fast_timers = a == "fast"
-            else:
-                self._dev_fast_timers = not self._dev_fast_timers
+            a = args[0].lower() if args else ""
+            if a and a not in ("fast", "normal"):
+                return "Usage: timers(fast|normal)"
+            with self._mood_lock:
+                self._dev_fast_timers = a == "fast" if a else not self._dev_fast_timers
             return self._timers_text()
         if name == "prompt":
             return f"[{self._last_gen_ms}ms]\n{self._last_prompt}"
@@ -726,9 +810,10 @@ class Mish:
         a = arg.strip()
         low = a.lower()
         if low in ("", "on", "off"):
-            on = (not self.dev_mode) if not low else low == "on"
-            self.dev_mode = on
-            self._dev_fast_timers = on
+            with self._mood_lock:
+                on = (not self.dev_mode) if not low else low == "on"
+                self.dev_mode = on
+                self._dev_fast_timers = on
             self.settings.update(dev=1 if on else 0)
             self.ui.put(("dev_panel", on))                         # UI opens / closes the console
             return "Dev mode ON: fast timers, console open." if on else "Dev mode OFF: normal timers."
@@ -766,9 +851,13 @@ class Mish:
     def thinking_visible(self) -> bool:
         return self._busy_visible > 0
 
-    def say(self, text: str, toast: bool = False, expr: str | None = None):
+    @staticmethod
+    def _speech_text(text: str) -> str:
         text = re.sub(r"[ \t]+", " ", text or "")
-        text = re.sub(r"\s*\n\s*", "\n", text).strip()
+        return re.sub(r"\s*\n\s*", "\n", text).strip()
+
+    def say(self, text: str, toast: bool = False, expr: str | None = None):
+        text = self._speech_text(text)
         if not text:
             return
         self.ui.put(("say", text, expr))
@@ -789,12 +878,13 @@ class Mish:
         acts = "\n".join(f"- {a['t'][11:16]} {a['text'][:120]}" for a in self.store.data["activity"][-2:]) or "(nothing yet)"
         s = self.store.today_stats()
         top = max(s["apps"], key=s["apps"].get) if s["apps"] else None
-        if self.focus_paused_rem > 0:
-            focus_line = f"Focus: PAUSED ({fmt_dur(self.focus_paused_rem)} left). "
-        elif self.in_break():
-            focus_line = f"Break: ON ({fmt_dur(self.focus_until - time.time())} left). "
-        elif self.in_focus():
-            focus_line = f"Focus: ON ({fmt_dur(self.focus_until - time.time())} left). "
+        phase, paused, left = self._timer_snapshot()
+        if paused > 0:
+            focus_line = f"Focus: PAUSED ({fmt_dur(paused)} left). "
+        elif phase == "break" and left > 0:
+            focus_line = f"Break: ON ({fmt_dur(left)} left). "
+        elif phase == "work" and left > 0:
+            focus_line = f"Focus: ON ({fmt_dur(left)} left). "
         else:
             focus_line = ""
         return (
@@ -823,7 +913,9 @@ class Mish:
             parts.append("Lines you already said (do NOT repeat or reuse their wording):\n"
                          + "\n".join(f"- {r}" for r in recent))
         if chat:
-            parts.append(OPEN_RULE)
+            with self._mood_lock:
+                hint = PROFILES[self.active_profile]["persona"]
+            parts.extend((hint, OPEN_RULE))
         system = "\n\n".join(parts)
 
         messages = [{"role": "system", "content": system}]
@@ -863,6 +955,9 @@ class Mish:
     def react_async(self, event: str, window: str = "", extra: str = "",
                     bypass_cooldown: bool = False):
         """Run reactions off the UI thread and emit UI updates through the queue."""
+        if self._profile_mutes(event):
+            return
+
         def work():
             if self.stop_event.is_set() or (self.strike_mode and event not in STRIKE_EVENTS):
                 return
@@ -870,7 +965,12 @@ class Mish:
                 self.remind_now()
                 return
             line = self._ambient_line(event, window, extra, bypass_cooldown)
-            self.say(line, expr=EVENT_HINTS.get(event))
+            text = self._speech_text(line)
+            expr = EVENT_HINTS.get(event)
+            if text:
+                with self._mood_lock:
+                    if event not in PROFILES[self.active_profile]["muted"]:
+                        self.ui.put_nowait(("say", text, expr))
         threading.Thread(target=work, daemon=True).start()
 
     # ---- screen vision --------------------------------------------------------------
@@ -926,11 +1026,17 @@ class Mish:
         threading.Thread(target=work, daemon=True).start()
 
     # ---- focus, tasks, stats ----------------------------------------------------------
+    def _timer_snapshot(self) -> tuple[str, float, float]:
+        with self._mood_lock:
+            return self.focus_phase, self.focus_paused_rem, max(0.0, self.focus_until - time.time())
+
     def in_focus(self) -> bool:
-        return self.focus_phase == "work" and self.focus_paused_rem <= 0 and time.time() < self.focus_until
+        with self._mood_lock:
+            return self.focus_phase == "work" and self.focus_paused_rem <= 0 and time.time() < self.focus_until
 
     def in_break(self) -> bool:
-        return self.focus_phase == "break" and self.focus_paused_rem <= 0 and time.time() < self.focus_until
+        with self._mood_lock:
+            return self.focus_phase == "break" and self.focus_paused_rem <= 0 and time.time() < self.focus_until
 
     def _play_chime(self, ascending: bool = True):
         if winsound is None:
@@ -946,75 +1052,83 @@ class Mish:
 
     def start_focus(self, minutes: int = FOCUS_DEFAULT_MIN, break_min: int | None = None) -> str:
         minutes = max(1, min(240, int(minutes)))
-        self.focus_duration_min = minutes
-        self.focus_phase = "work"
-        self.focus_paused_rem = 0.0
-        self.focus_until = time.time() + minutes * 60
-        self.pomo_cycle = (minutes, max(1, min(60, int(break_min)))) if break_min else None
-        self.ui.put(("timer", minutes, 0, "work"))
-        if self.pomo_cycle:
-            return f"Pomodoro ON: {minutes}m focus / {self.pomo_cycle[1]}m break."
+        cycle = (minutes, max(1, min(60, int(break_min)))) if break_min else None
+        with self._mood_lock:
+            self.focus_duration_min = minutes
+            self.focus_phase = "work"
+            self.focus_paused_rem = 0.0
+            self.focus_until = time.time() + minutes * 60
+            self.pomo_cycle = cycle
+            self._activate_profile_locked("work")
+            self.ui.put(("timer", minutes, 0, "work"))
+        if cycle:
+            return f"Pomodoro ON: {minutes}m focus / {cycle[1]}m break."
         return f"Focus mode ON ({minutes}m)."
 
     def pause_focus(self) -> str:
-        if self.focus_phase == "off" or self.focus_paused_rem > 0:
-            return "No active timer to pause."
-        rem = max(1.0, self.focus_until - time.time())
-        self.focus_paused_rem = rem
-        self.focus_until = 0.0
-        self.ui.put(("timer_clear",))
+        with self._mood_lock:
+            if self.focus_phase == "off" or self.focus_paused_rem > 0:
+                return "No active timer to pause."
+            rem = max(1.0, self.focus_until - time.time())
+            self.focus_paused_rem = rem
+            self.focus_until = 0.0
+            self.ui.put(("timer_clear",))
+        self._refresh_profile()
         return f"Timer paused ({fmt_dur(rem)} left). Say: resume focus"
 
     def resume_focus(self) -> str:
-        if self.focus_paused_rem <= 0:
-            return "No paused timer."
-        rem = self.focus_paused_rem
-        self.focus_paused_rem = 0.0
-        self.focus_until = time.time() + rem
-        self.ui.put(("timer", int(rem // 60), int(rem % 60), self.focus_phase))
-        return f"Resumed {self.focus_phase} ({fmt_dur(rem)} left)."
+        with self._mood_lock:
+            if self.focus_paused_rem <= 0:
+                return "No paused timer."
+            rem, phase = self.focus_paused_rem, self.focus_phase
+            self.focus_paused_rem = 0.0
+            self.focus_until = time.time() + rem
+            if phase == "work":
+                self._activate_profile_locked("work")
+            self.ui.put(("timer", int(rem // 60), int(rem % 60), phase))
+        return f"Resumed {phase} ({fmt_dur(rem)} left)."
 
     def stop_focus(self) -> str:
-        was = self.focus_phase != "off" or self.focus_paused_rem > 0
-        self.focus_until = 0.0
-        self.focus_paused_rem = 0.0
-        self.focus_phase = "off"
-        self.pomo_cycle = None
-        self.ui.put(("timer_clear",))
+        with self._mood_lock:
+            was = self.focus_phase != "off" or self.focus_paused_rem > 0
+            self.focus_until = 0.0
+            self.focus_paused_rem = 0.0
+            self.focus_phase = "off"
+            self.pomo_cycle = None
+            self.ui.put(("timer_clear",))
+        self._refresh_profile()
         return "Focus off." if was else "Focus wasn't on."
 
     def _tick_timer(self, now: float):
-        if self.focus_phase == "off" or self.focus_paused_rem > 0:
-            return
-        left = self.focus_until - now
-        if left > 0:
-            self.ui.put(("timer", int(left // 60), int(left % 60), self.focus_phase))
-            return
-        # Phase finished!
-        finished = self.focus_phase
-        self.ui.put(("timer_clear",))
+        with self._mood_lock:
+            if self.focus_phase == "off" or self.focus_paused_rem > 0:
+                return
+            left = self.focus_until - now
+            if left > 0:
+                self.ui.put(("timer", int(left // 60), int(left % 60), self.focus_phase))
+                return
+            finished, cycle = self.focus_phase, self.pomo_cycle
+            self.ui.put(("timer_clear",))
+            if finished == "work":
+                self.pomo_sessions += 1
+                sessions = self.pomo_sessions
+            if cycle is None:
+                self.focus_phase, self.focus_until = "off", 0.0
+            elif finished == "work":
+                self.focus_phase, self.focus_until = "break", now + cycle[1] * 60
+            else:
+                self.focus_phase, self.focus_until = "work", now + cycle[0] * 60
+                self._activate_profile_locked("work")
+        if finished == "work" or cycle is None:
+            self._refresh_profile()
+        self._play_chime(ascending=finished == "work")
         if finished == "work":
-            self.pomo_sessions += 1
-            self._play_chime(ascending=True)
-            if self.pomo_cycle:
-                _w, b_min = self.pomo_cycle
-                self.focus_phase = "break"
-                self.focus_until = now + b_min * 60
-                self.say(f"Focus block #{self.pomo_sessions} done! Take a {b_min}m break.", toast=True, expr="happy")
+            if cycle:
+                self.say(f"Focus block #{sessions} done! Take a {cycle[1]}m break.", toast=True, expr="happy")
             else:
-                self.focus_phase = "off"
-                self.focus_until = 0.0
                 self.say(self._canned("focus_end") or "Focus session complete.", expr="happy")
-        else:
-            self._play_chime(ascending=False)
-            if self.pomo_cycle:
-                w_min, _b = self.pomo_cycle
-                self.focus_phase = "work"
-                self.focus_until = now + w_min * 60
-                self.say(f"Break's over! Back to work for {w_min}m.", toast=True, expr="focus")
-            else:
-                self.focus_phase = "off"
-                self.focus_until = 0.0
+        elif cycle:
+            self.say(f"Break's over! Back to work for {cycle[0]}m.", toast=True, expr="focus")
 
     def tasks_text(self) -> str:
         tasks = self.store.pending()
@@ -1246,10 +1360,11 @@ class Mish:
     def _bang_focus(self, arg: str) -> str:
         a = arg.strip().lower()
         if not a:
-            if self.focus_paused_rem > 0:
-                return f"Paused ({fmt_dur(self.focus_paused_rem)} left). Use !focus resume or !focus stop."
-            if self.focus_phase != "off":
-                return f"{self.focus_phase.capitalize()} active: {fmt_dur(max(0, self.focus_until - time.time()))} left."
+            phase, paused, left = self._timer_snapshot()
+            if paused > 0:
+                return f"Paused ({fmt_dur(paused)} left). Use !focus resume or !focus stop."
+            if phase != "off":
+                return f"{phase.capitalize()} active: {fmt_dur(left)} left."
             return "Timer off. Usage: !focus [min] | !focus pomo [work] [break] | pause | resume | stop"
         if a == "stop":
             return self.stop_focus()
@@ -1267,8 +1382,8 @@ class Mish:
         return "Usage: !focus [min] | !focus pomo [work] [break] | pause | resume | stop"
 
     def _bang_ver(self, _arg: str) -> str:
-        prof = self.settings.data.get("profile", "general")
-        return f"Mish v{__version__} (profile: {prof})"
+        with self._mood_lock:
+            return f"Mish v{__version__} (profile: {self.active_profile})"
 
     def _bang_bb(self, arg: str) -> str:
         if not arg:
@@ -1310,13 +1425,21 @@ class Mish:
 
     def _bang_profile(self, arg: str) -> str:
         chosen = arg.strip().lower()
-        if not chosen or chosen not in FOCUS_PROFILES:
-            opts = ", ".join(FOCUS_PROFILES.keys())
-            cur = self.settings.data.get("profile", "general")
-            return f"Current profile: {cur}. Options: {opts}"
-        self.settings.data["profile"] = chosen
-        self.settings.save()
-        return f"Switched focus profile to {chosen}!"
+        if chosen and chosen not in (*PROFILE_NAMES, "auto"):
+            return "Usage: !profile [work|neutral|chill|auto]"
+        if chosen:
+            with self._mood_lock:
+                self.profile_auto = chosen == "auto"
+                if not self.profile_auto:
+                    self._pinned_profile = chosen
+                    self._activate_profile_locked("work" if self.in_focus() else chosen)
+                self.settings.data.update(profile=self._pinned_profile, profile_auto=int(self.profile_auto))
+            if chosen == "auto":
+                self._refresh_profile()
+            self.settings.save()
+        with self._mood_lock:
+            mode = "auto" if self.profile_auto else f"pinned to {self._pinned_profile}"
+            return f"Profile: {self.active_profile} ({mode}). Options: work, neutral, chill, auto."
 
     def _bang_clip2task(self, _arg: str) -> str:
         clip = self.get_clipboard_text(200)
@@ -1543,19 +1666,14 @@ class Mish:
         finally:
             user32.CloseClipboard()
 
+    def _profile_category(self, detail: str) -> str:
+        with self._mood_lock:
+            return PROFILES[self.active_profile]["categories"].get(detail, "neutral")
+
     def _classify_both(self, title: str, app: str) -> tuple[str, str]:
-        """(category, detail): category is work/slack/neutral (stats, focus), detail is game/media/social/code/work/neutral."""
-        prof = FOCUS_PROFILES.get(self.settings.data.get("profile", "general"), FOCUS_PROFILES["general"])
-        hay = f"{app} {title}".lower()
-        if any(k in hay for k in prof.get("work_extra", [])):
-            return "work", "work"
-        if any(k in hay for k in prof.get("slacking_extra", [])):
-            return "slack", "media"
+        """Return the active profile's category and the unmodified foreground detail."""
         detail = classify_detail(title, app)
-        cat = detail_to_cat(detail)
-        if cat == "slack" and not prof.get("nag_slacking", True):
-            return "neutral", "neutral"
-        return cat, detail
+        return self._profile_category(detail), detail
 
     def classify_with_profile(self, title: str, app: str) -> str:
         """Backward compatible: 'work' | 'slack' | 'neutral'."""
@@ -1675,7 +1793,8 @@ class Mish:
     def pester_loop(self):
         while not self.stop_event.wait(random.randint(PESTER_MIN * 60, PESTER_MAX * 60)):
             try:
-                if idle_seconds() < IDLE_PAUSE and not self.in_focus() and not self.strike_mode:
+                if (not self._profile_mutes("pester") and idle_seconds() < IDLE_PAUSE
+                        and not self.in_focus() and not self.strike_mode):
                     self.react_async("pester")
             except Exception as e:
                 log("pester_loop error:", repr(e))
@@ -1699,11 +1818,18 @@ class Mish:
         while True:
             try:
                 self.store.run_daily_decay()
-                for task in self.store.due_for_nag(datetime.now()):
-                    self._bump_annoyance(ANNOY_NAG_STEP)               # ignored nags make him crankier
-                    line = self._ambient_line("nag", extra=task["text"])
-                    self.say(line or f"Task due: {task['text']}", expr="squint")   # plain status if nothing to say
-                    self.store.mark_nagged(task)
+                if not self._profile_mutes("nag"):
+                    for task in self.store.due_for_nag(datetime.now()):
+                        with self._mood_lock:
+                            if self._profile_mutes("nag"):
+                                break
+                            self._bump_annoyance(ANNOY_NAG_STEP)
+                        line = self._ambient_line("nag", extra=task["text"])
+                        with self._mood_lock:
+                            if self._profile_mutes("nag"):
+                                break
+                            self.say(line or f"Task due: {task['text']}", expr="squint")
+                        self.store.mark_nagged(task)
                 self._nag_memory_pressure()
             except Exception as e:
                 log("scheduler_loop error:", repr(e))
@@ -1725,34 +1851,45 @@ class Mish:
                 dt = clamp(now - last_tick, 0.0, 5.0)
                 last_tick = now
                 focus = self.in_focus()
+                local_now = datetime.fromtimestamp(now)
                 if idle_seconds() >= IDLE_PAUSE and not focus:
-                    self._mood_decay(now, "neutral", "neutral")      # away from the keyboard counts as calm
+                    self._track_streak("neutral", 0.0, "(idle)")
+                    self._refresh_profile(local_now)
+                    self._mood_decay(now, "neutral", "neutral")
+                    last_title = ""
                     continue
                 title, app = get_active_window_info()
-                if self.dev_mode and title == "Mish Dev Console":
+                with self._mood_lock:
+                    dev_mode = self.dev_mode
+                if dev_mode and title == "Mish Dev Console":
                     continue
                 if not (title or app):
-                    self._live_friendly = "(empty title/app)"
+                    self._track_streak("neutral", 0.0, "(empty title/app)")
+                    self._refresh_profile(local_now)
+                    last_title = ""
                     continue
-                cat, detail = self._classify_both(title, app)
+                detail = classify_detail(title, app)
                 friendly = friendly_app_name(title, app) or title or app or "(unnamed)"
-                self._live_friendly = friendly
+                self._track_streak(detail, dt, friendly)
+                self._refresh_profile(local_now)
+                cat = self._profile_category(detail)
+                focus = self.in_focus()
                 self.store.record_usage(app or title[:30], cat, 1.5)
-                self._track_streak(detail, dt)
                 self._mood_decay(now, cat, detail)
 
                 if focus and cat == "slack":
                     if now - last_react >= min(15, self._reaction_cooldown()):
                         last_react = now
                         self.ui.put(("focus_punish", title))
-                        self._slack_bump(now, focus=True)
+                        self._slack_bump(now)
                 elif title != last_title:
                     last_title = title
-                    if now - last_react >= self._reaction_cooldown() and random.random() < self._switch_chance():
+                    event = ("gaming" if detail == "game" else "slacking") if cat == "slack" else "switch"
+                    if (not self._profile_mutes(event) and now - last_react >= self._reaction_cooldown()
+                            and random.random() < self._switch_chance()):
                         last_react = now
-                        event = "gaming" if detail == "game" else "slacking" if cat == "slack" else "switch"
                         self.react_async(event, friendly)
-                if cat == "slack" and not focus and self._slack_bump(now, focus=False):
+                if cat == "slack" and not focus and self._slack_bump(now):
                     if now - last_react >= self._reaction_cooldown():   # a long streak earns a callout, {mins} is live
                         last_react = now
                         self.react_async("gaming" if detail == "game" else "slacking", friendly)
@@ -2227,7 +2364,7 @@ EXE_RE = re.compile(r"[a-z0-9._ -]{1,40}")
 
 class Settings:
     DEFAULTS = dict(eye="#ffffff", bg="#08080a", shape="pill", mood=True, opacity=0.95, apps=None, heavy=None,
-                    profile="general", theme="auto", **DEFAULT_SETTINGS)
+                    theme="auto", **DEFAULT_SETTINGS)
 
     @classmethod
     def fresh(cls) -> dict:
@@ -2239,6 +2376,8 @@ class Settings:
     def __init__(self, path):
         self.path = Path(path)
         self.data = self.fresh()
+        self._save_ready = threading.Condition()
+        self._saving = False
         self.load()
 
     @staticmethod
@@ -2258,7 +2397,9 @@ class Settings:
         if key == "mood":
             return bool(v) if isinstance(v, (bool, int)) else None
         if key == "profile":
-            return v if isinstance(v, str) and v in FOCUS_PROFILES else None
+            return v if isinstance(v, str) and v in PROFILE_NAMES else "neutral"
+        if key == "profile_auto":
+            return 1 if v in (1, True, "1") else 0 if v in (0, False, "0") else None
         if key == "apps":
             if not isinstance(v, dict):
                 return None
@@ -2294,6 +2435,9 @@ class Settings:
             log("settings load failed:", repr(e))
 
     def save(self):
+        with self._save_ready:
+            self._save_ready.wait_for(lambda: not self._saving)
+            self._saving = True
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
@@ -2301,6 +2445,10 @@ class Settings:
             os.replace(tmp, self.path)
         except Exception as e:
             log("settings save failed:", repr(e))
+        finally:
+            with self._save_ready:
+                self._saving = False
+                self._save_ready.notify()
 
     def __getitem__(self, key):
         return self.data[key]
@@ -2309,9 +2457,10 @@ class Settings:
         return self.data.get(key, default)
 
     def reset(self):
-        preserved = {key: self.data[key] for key in ("dev", "brain_mode")}
-        self.data = self.fresh()
-        self.data.update(preserved)
+        defaults = self.fresh()
+        for key in ("dev", "brain_mode", "profile", "profile_auto"):
+            defaults.pop(key)
+        self.data.update(defaults)
         self.save()
 
     def update(self, **kw):
