@@ -16,10 +16,12 @@ import pystray
 import ctypes.wintypes as _wt
 import random
 import winreg
+from functools import lru_cache
 from pathlib import Path
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageTk
 
 from .config import AUTO_SLEEP_TIMEOUT, FOCUS_DEFAULT_MIN, HOTKEY_MOD, HOTKEY_VK, user_data_dir
+from .eyes import ProfileEyeEngine, annoyance_tier, effective_eye_shape, is_eye_shape_pinned
 from .win_utils import (
     _LayeredSurface,
     _MONINFO,
@@ -35,7 +37,6 @@ from .brain import (
     EXPRESSIONS,
     EYE_PRESETS,
     GLYPHS,
-    EyeEngine,
     STATE_RGB,
     Mish,
     _hex_rgb,
@@ -1488,7 +1489,8 @@ class CustomizeStudio(_HudPanel):
         self.title_lbl = self._header(body, "MISH // STUDIO")
 
         pv = self._card(body)                                         # live preview
-        self.preview = MiniPreview(pv.body, W, 96, th, acc, s["eye"], s["shape"], s["mood"], bg=c["card"])
+        self.preview = MiniPreview(pv.body, W, 96, th, acc, s["eye"], self.face._effective_eye_shape(),
+                                   s["mood"], bg=c["card"])
         self.preview.pack()
 
         card = self._card(body, "GLOW COLOUR")
@@ -1533,6 +1535,8 @@ class CustomizeStudio(_HudPanel):
 
     # ---- state ----
     def change(self, **kw):
+        if kw.get("shape") == "auto":
+            kw["shape"] = "pill"
         before = getattr(self.face, "_panel_key", None)
         self.s.update(**kw)
         self.face.apply_theme()                                       # may schedule rebuild() via _retheme_panels
@@ -1563,7 +1567,7 @@ class CustomizeStudio(_HudPanel):
             self.shape_seg.set_value(s["shape"])
             if self.mood_sw.get() != bool(s["mood"]):
                 self.mood_sw.set(bool(s["mood"]), animate=True)
-            self.preview.update_preview(s["eye"], s["shape"], s["mood"])
+            self.preview.update_preview(s["eye"], self.face._effective_eye_shape(), s["mood"])
         except tk.TclError:
             pass
 
@@ -1883,7 +1887,7 @@ class RobotFaceWindow:
     def __init__(self, root: tk.Tk, mish: Mish, ui_queue: queue.Queue):
         self.root, self.mish, self.ui = root, mish, ui_queue
         self.settings = mish.settings
-        self.eyes = EyeEngine()
+        self.eyes = ProfileEyeEngine()
         self.active_bubble = None
         self._bubble_is_timer = False
         self.cust = None
@@ -2048,11 +2052,20 @@ class RobotFaceWindow:
          self.bg, self.eye_col = s["bg"], s["eye"]
          self.panel = _rgb_hex(_mix(_hex_rgb(self.bg), (255, 255, 255), 0.07))
 
+    def _eye_profile_mood(self) -> tuple[str, int]:
+        with self.mish._mood_lock:
+            return self.mish.active_profile, self.mish.annoyance
+
+    def _effective_eye_shape(self, profile_mood: tuple[str, int] | None = None) -> str:
+        profile, annoyance = profile_mood if profile_mood is not None else self._eye_profile_mood()
+        saved = self.settings["shape"]
+        return effective_eye_shape(saved, annoyance, is_eye_shape_pinned(saved), profile=profile)
+
     def apply_theme(self):
         """Apply Settings to the window, eyes, gear button, menu and bubbles. Safe to call any time."""
         self._derive_theme()
         s = self.settings
-        self.eyes.configure(color=self.eye_col, mood=s["mood"], shape=s["shape"])
+        self.eyes.configure(color=self.eye_col, mood=s["mood"], shape=self._effective_eye_shape())
         self.draw_squircle_background()
         self.canvas.tag_lower("bg_squircle")                  # keep the background behind the eye pixels
         self.btn_gear.configure(bg=self.panel, fg=self.eye_col, activebackground=self.eye_col, activeforeground=self.bg)
@@ -2261,14 +2274,20 @@ class RobotFaceWindow:
         face = (self.root.winfo_x() + self.FACE_CENTER[0], self.root.winfo_y() + self.FACE_CENTER[1])
         inertia = (0.0, 0.0) if self.is_sleeping else (
             clamp(-self.vel_x * 0.12, -4, 4), clamp(-self.vel_y * 0.12, -3, 3))
+        profile_mood = self._eye_profile_mood()
+        profile, annoyance = profile_mood
         self.eyes.update(now, {
             "strike": self.mish.strike_mode, "sleeping": self.is_sleeping, "scared": self.is_scared,
             "dizzy": self.is_dizzy, "held": self.is_held, "thinking": self.mish.thinking_visible,
             "listening": self.is_listening, "focus": self.mish.in_focus(), "idle_t": self.idle_t,
+            "profile": profile, "annoyance": annoyance, "mood_tier": annoyance_tier(annoyance),
+            "shape_pinned": is_eye_shape_pinned(self.settings["shape"]),
             "pointer": pointer, "face": face, "inertia": inertia,
         })
+        self.eyes.configure(shape=self._effective_eye_shape(profile_mood))
         cells = self.eyes.cells(now)
-        if self.is_sleeping:
+        mask = self.eyes.mask_spec(now)
+        if mask and mask[2] == "sleeping":
             self.add_zzz(cells)
         self.draw_cells(cells)
 
@@ -2316,7 +2335,6 @@ class RobotFaceWindow:
         elif idle_t < AUTO_SLEEP_TIMEOUT and self.is_sleeping:
             self.is_sleeping = False
             self.root.wm_attributes("-alpha", self.settings["opacity"])
-            self.eyes.set_expression("surprised", 1.2)
             self.mish.react_async("wake")
 
         off_edge = cur_x < -20 or cur_x > sw - 180 or cur_y < -20 or cur_y > sh - 90   # scared at the screen edge
@@ -2574,6 +2592,8 @@ class LayeredMishWindow(RobotFaceWindow):
     """RobotFaceWindow rendered through UpdateLayeredWindow, plus the top handle and Dynamic Island."""
 
     HANDLE, HANDLE_WIDE = (150, 22), (212, 28)       # notch: resting / hovered
+    HANDLE_EYE_SCALE, ISLAND_EYE_SCALE = 0.33, 0.38
+    SLEEP_MASK_SIZE = (116, 40)
     ISLAND_W, ISLAND_MIN_H, ISLAND_MAX_LINES = 368, 56, 6
     ISLAND_Y, DOCK_Y, DOCK_ZONE_Y, PULL_DY = 8, 18, 30, 14
     BODY_RECT, BODY_PAD = (48, 12, 192, 92), 4       # obsidian squircle inside the 240x130 window
@@ -2589,6 +2609,8 @@ class LayeredMishWindow(RobotFaceWindow):
     def __init__(self, root, mish, ui_queue):
         # everything the first animate_loop() tick (inside super().__init__) may touch
         self._sf = _LayeredSurface()
+        self._frame_buffers = {}
+        self._shell_cache = None
         self._alpha = float(mish.settings["opacity"])
         self._mode = "float"                         # logical mode: float | handle | island
         self._g = dict(w=float(self.SIZE[0]), h=float(self.SIZE[1]), r=float(self.RADIUS), flat=0.0)
@@ -2640,51 +2662,53 @@ class LayeredMishWindow(RobotFaceWindow):
         return self._orig_wma(*a, **kw)
 
     # ------------------------------------------------------------------ cached sprites
-    def _eye_sprite(self, spec, rgb):
-        """One vector eye (3x supersampled, LANCZOS down) with a tight bloom. Cached by (spec, colour)."""
-        key = (spec, rgb)
+    def _eye_sprite(self, spec, rgb, scale=1.0):
+        """Render one eye at the requested scale with 3x supersampling and cache the sprite."""
+        key = (spec, rgb, scale)
         spr = self._eye_cache.get(key)
         if spr is not None:
             return spr
         kind, w, hb, eh, rad, top, bot, slant, px, py, side = spec
-        S, P = 3, EYE_PAD
-        cw, chh = int(w + 2 * P), int(hb + 2 * P)
+        S, pad = 3, math.ceil(EYE_PAD * scale)
+        cw, chh = math.ceil(w * scale) + 2 * pad, math.ceil(hb * scale) + 2 * pad
+        unit = S * scale
         W, H = cw * S, chh * S
         m = Image.new("L", (W, H), 0)
         d = ImageDraw.Draw(m)
-        cx, cy, hw = W / 2.0, H / 2.0, w * S / 2.0
+        cx, cy, hw = W / 2.0, H / 2.0, w * unit / 2.0
         if kind == "dome":                                   # eh = dome height; flat bottom, round top
-            dh = eh * S
-            bottom = cy + 6 * S
+            dh = eh * unit
+            bottom = cy + 6 * unit
             d.rounded_rectangle((cx - hw, bottom - dh, cx + hw - 1, bottom + dh - 1),
-                                radius=min(rad * S, hw, dh), fill=255)
+                                radius=min(rad * unit, hw, dh), fill=255)
             d.rectangle((0, bottom, W, H), fill=0)
         else:
-            hh = eh * S / 2.0
+            hh = eh * unit / 2.0
             box = (cx - hw, cy - hh, cx + hw - 1, cy + hh - 1)
-            r = min(rad * S, hw, hh)
+            r = min(rad * unit, hw, hh)
             d.rounded_rectangle(box, radius=r, fill=255)
             if kind == "ring":
-                t = 3 * S
-                d.rounded_rectangle((box[0] + t, box[1] + t, box[2] - t, box[3] - t),
-                                    radius=max(0.0, r - t), fill=0)
-                pr = 3.5 * S
-                qx, qy = cx + px * S, cy + py * S
+                t = 3 * unit
+                if box[2] - box[0] >= 2 * t and box[3] - box[1] >= 2 * t:
+                    d.rounded_rectangle((box[0] + t, box[1] + t, box[2] - t, box[3] - t),
+                                        radius=max(0.0, r - t), fill=0)
+                pr = 3.5 * unit
+                qx, qy = cx + px * unit, cy + py * unit
                 d.ellipse((qx - pr, qy - pr, qx + pr, qy + pr), fill=255)
             if top > 0 or slant:                             # eyelid: erase above a (possibly slanted) line
-                yo = cy - hh + top * S
-                yl, yr = (yo - slant * S, yo + slant * S) if side == "l" else (yo + slant * S, yo - slant * S)
+                yo = cy - hh + top * unit
+                yl, yr = (yo - slant * unit, yo + slant * unit) if side == "l" else (yo + slant * unit, yo - slant * unit)
                 d.polygon([(0, 0), (W, 0), (W, yr), (0, yl)], fill=0)
             if bot > 0:
-                d.rectangle((0, cy + hh - bot * S, W, H), fill=0)
+                d.rectangle((0, cy + hh - bot * unit, W, H), fill=0)
         m = m.resize((cw, chh), Image.Resampling.LANCZOS)
         glow = Image.new("RGBA", (cw, chh), rgb + (255,))
-        glow.putalpha(m.filter(ImageFilter.GaussianBlur(3)).point(lambda v: int(v * 0.5)))
+        glow.putalpha(m.filter(ImageFilter.GaussianBlur(3 * scale)).point(lambda v: int(v * 0.5)))
         eye = Image.new("RGBA", (cw, chh), rgb + (255,))
         eye.putalpha(m)
         spr = Image.alpha_composite(glow, eye)
-        if len(self._eye_cache) > 400:
-            self._eye_cache.clear()
+        if len(self._eye_cache) >= 400:
+            self._eye_cache.pop(next(iter(self._eye_cache)))
         self._eye_cache[key] = spr
         return spr
 
@@ -2773,26 +2797,89 @@ class LayeredMishWindow(RobotFaceWindow):
         self._status_cache[key] = spr
         return spr
 
-    def _mini_eyes(self, lay, S, x, cy, ew, eh, gap, rgb, blink):
-        """Two tiny glowing pill eyes for the notch / island (bloom blurred in a tight crop only)."""
-        eh = max(2.0, eh * (1.0 - 0.85 * blink))
-        boxes = [((x + i * (ew + gap)) * S, (cy - eh / 2) * S, (x + i * (ew + gap) + ew) * S - 1, (cy + eh / 2) * S - 1)
-                 for i in range(2)]
-        rad = min(ew, eh) * S / 2.0
-        pad = 8 * S
-        x0c, y0c = max(0, int(boxes[0][0] - pad)), max(0, int(boxes[0][1] - pad))
-        x1c, y1c = min(lay.width, int(boxes[1][2] + pad)), min(lay.height, int(boxes[0][3] + pad))
-        if x1c > x0c and y1c > y0c:
-            gl = Image.new("RGBA", (x1c - x0c, y1c - y0c), (0, 0, 0, 0))
-            gd = ImageDraw.Draw(gl)
-            for b in boxes:
-                gd.rounded_rectangle((b[0] - x0c, b[1] - y0c, b[2] - x0c, b[3] - y0c), radius=rad, fill=rgb + (255,))
-            gl = gl.filter(ImageFilter.GaussianBlur(2.6 * S))
-            gl.putalpha(gl.getchannel("A").point(lambda v: int(v * 0.7)))
-            lay.alpha_composite(gl, (x0c, y0c))
-        d = ImageDraw.Draw(lay)
-        for b in boxes:
-            d.rounded_rectangle(b, radius=rad, fill=rgb + (255,))
+    def _mini_eyes(self, layer, cx, cy, scale):
+        """Composite the live eye sprites at notch scale, including their gaze and expression offsets."""
+        st = self._st
+        if not st:
+            return
+        for spec, eye_x, eye_y in st["eyes"]:
+            sprite = self._eye_sprite(spec, st["rgb"], scale)
+            x = round(cx + (eye_x - self.FACE_CENTER[0]) * scale - sprite.width / 2)
+            y = round(cy + (eye_y - EYE_CY) * scale - sprite.height / 2)
+            layer.alpha_composite(sprite, (x, y))
+
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _sleep_mask_sprite(w, h, rgb, mode):
+        """Cache the contoured mask at native size after supersampling."""
+        S = _SS
+        layer = Image.new("RGBA", (w * S, h * S))
+        draw = ImageDraw.Draw(layer)
+        W, H = layer.size
+
+        # Fade the strap away from the sides of the mask.
+        strap = tuple(round(c) for c in _mix((28, 32, 44), rgb, 0.15))
+        span = max(1, round(W * 0.16))
+        for x in range(span):
+            color = strap + (round(180 * x / span),)
+            draw.line((x, H * 0.44, x, H * 0.61), fill=color)
+            draw.line((W - 1 - x, H * 0.44, W - 1 - x, H * 0.61), fill=color)
+
+        # Bézier segments shape the top edge, eye cups, and bridge notch.
+        start = (0.09, 0.51)
+        segments = (
+            ((0.08, 0.19), (0.22, 0.08), (0.38, 0.16)),
+            ((0.46, 0.20), (0.54, 0.20), (0.62, 0.16)),
+            ((0.78, 0.08), (0.92, 0.19), (0.91, 0.51)),
+            ((0.91, 0.80), (0.78, 0.94), (0.65, 0.86)),
+            ((0.56, 0.83), (0.55, 0.72), (0.50, 0.72)),
+            ((0.45, 0.72), (0.44, 0.83), (0.35, 0.86)),
+            ((0.22, 0.94), (0.09, 0.80), start),
+        )
+        outline = [(start[0] * W, start[1] * H)]
+        a = start
+        for b, c, d in segments:
+            for step in range(1, 9):
+                t = step / 8
+                s = 1 - t
+                x = s ** 3 * a[0] + 3 * s * s * t * b[0] + 3 * s * t * t * c[0] + t ** 3 * d[0]
+                y = s ** 3 * a[1] + 3 * s * s * t * b[1] + 3 * s * t * t * c[1] + t ** 3 * d[1]
+                outline.append((x * W, y * H))
+            a = d
+        draw.polygon(outline, fill=(22, 25, 34, 255))
+        rim = tuple(round(c) for c in _mix((59, 63, 80), rgb, 0.35)) + (255,)
+        rim_px = 1.5 if mode == "float" else 0.75
+        draw.line(outline, fill=rim, width=round(rim_px * S), joint="curve")
+        return layer.resize((w, h), Image.Resampling.LANCZOS)
+
+    @classmethod
+    @lru_cache(maxsize=32)
+    def _faded_sleep_mask(cls, w, h, rgb, mode, alpha):
+        sprite = cls._sleep_mask_sprite(w, h, rgb, mode).copy()
+        sprite.putalpha(sprite.getchannel("A").point(lambda v: round(v * alpha)))
+        return sprite
+
+    def _draw_sleep_mask(self, layer, cx, cy, scale, mode):
+        st = self._st
+        if not st or st["mask"] is None:
+            return
+        offset, alpha, _phase = st["mask"]
+        if alpha == 0:
+            return
+        w, h = (round(size * scale) for size in self.SLEEP_MASK_SIZE)
+        args = (w, h, st["mask_rgb"], mode)
+        sprite = self._sleep_mask_sprite(*args) if alpha == 1 else self._faded_sleep_mask(*args, alpha)
+        y = cy + (offset + st["mask_bob"]) * scale
+        layer.alpha_composite(sprite, (round(cx - w / 2), round(y - h / 2)))
+
+    def _frame_buffer(self, name, w, h):
+        """Reuse a transparent layer at the current native dimensions."""
+        layer = self._frame_buffers.get(name)
+        if layer is None or layer.size != (w, h):
+            layer = self._frame_buffers[name] = Image.new("RGBA", (w, h))
+        else:
+            layer.paste((0, 0, 0, 0), (0, 0, w, h))
+        return layer
 
     # ------------------------------------------------------------------ visual state (cheap; drives the redraw signature)
     def _status(self):
@@ -2829,10 +2916,16 @@ class LayeredMishWindow(RobotFaceWindow):
             return x0 <= px <= x1 and y0 <= py <= y1
         return -2 <= px <= self._g["w"] + 2 and -2 <= py <= self._g["h"] + 2
 
-    def _visual_state(self, now, pointer):
+    def _visual_state(self, now, pointer, profile_mood: tuple[str, int] | None = None):
+        if profile_mood is None:
+            profile_mood = self._eye_profile_mood()
+        profile, annoyance = profile_mood
         e, p = self.eyes, self.eyes.p
+        mask = e.mask_spec(now)
+        masked = mask is not None and mask[2] == "sleeping"
         ex = EXPRESSIONS[e.active]
-        w, hb, rad = SHAPE_DIMS.get(self.settings["shape"], SHAPE_DIMS["pill"])
+        shape = self._effective_eye_shape(profile_mood)
+        w, hb, rad = SHAPE_DIMS[shape]
         sc, blink, hs = hb / 12.0, e.blink_amt, p["h"]
         pulse = 1 if (now < e.talk_until and math.sin(now * 16.0) > 0.4) else 0
         gx = clamp(e.gaze[0] + p["gx"] + e.inertia[0], -4, 4)
@@ -2845,7 +2938,7 @@ class LayeredMishWindow(RobotFaceWindow):
         ring = p["ring"] > 0.5
         gox, goy = (0, 0) if ring else (int(round(gx * 1.6)), int(round(gy * 1.5)))
         eyes = []
-        for side, sgn in (("l", -1), ("r", 1)):
+        for side, sgn in (() if masked else (("l", -1), ("r", 1))):
             cx = int(round(120 + sgn * (EYE_GAP / 2.0 + w / 2.0) + gox + jx))
             cy = EYE_CY + goy + jy
             scale = (0.62 if side == "l" else 1.05) if e.active == "thinking" else 1.0
@@ -2873,16 +2966,19 @@ class LayeredMishWindow(RobotFaceWindow):
                 spec = ("ring" if ring else "cap", w, hb, eh, rad, round(top * 2) / 2, round(bot * 2) / 2,
                         round(slant * 2) / 2, int(round(pxo)), int(round(pyo)), side)
             eyes.append((spec, cx, cy))
-        rgb = _q(e.color)
+        rgb = e.base_rgb if masked or e.color == e.base_rgb else _q(e.color)
+        mask_rgb = _q(e.base_rgb) if mask else None
+        mask_bob = e.mask_bob(now) if masked else 0.0
         status = self._status()
         st = dict(
             eyes=tuple(eyes), rgb=rgb, status=status, hover=self._hover(pointer),
-            emote=(e.emote, 1 if int(now * 5) % 2 else 0) if (e.emote and now < e.emote_until) else None,
-            zzz=int(round(math.sin(now * 2.2) * 2)) if self.is_sleeping else None,
-            blink=round(blink, 1),
+            emote=(e.emote, 1 if int(now * 5) % 2 else 0) if (not masked and e.emote and now < e.emote_until) else None,
+            zzz=int(round(math.sin(now * 2.2) * 2)) if masked else None,
+            mask=mask, mask_rgb=mask_rgb, mask_bob=mask_bob, shape=shape,
             breath=int(round(math.sin(now * (0.7 if self.is_sleeping else 1.15)) * 3)),   # -3..3 -> +-1.5%
         )
-        st["mini"] = (rgb, st["blink"], status, st["hover"])
+        st["mini"] = (st["eyes"], shape, profile, annoyance_tier(annoyance), e.active, rgb, status, st["hover"],
+                      mask, mask_rgb, mask_bob)
         return st
 
     def render_16bit_eyes(self):
@@ -2898,14 +2994,17 @@ class LayeredMishWindow(RobotFaceWindow):
         wx, wy = self._win_xy()
         inertia = (0.0, 0.0) if self.is_sleeping else (
             clamp(-self.vel_x * 0.12, -4, 4), clamp(-self.vel_y * 0.12, -3, 3))
+        profile_mood = self._eye_profile_mood()
+        profile, annoyance = profile_mood
         self.eyes.update(now, {
             "strike": self.mish.strike_mode, "sleeping": self.is_sleeping, "scared": self.is_scared,
             "dizzy": self.is_dizzy, "held": self.is_held, "thinking": self.mish.thinking_visible,
             "listening": self.is_listening, "focus": self.mish.in_focus(), "idle_t": self.idle_t,
-            "annoyance": self.mish.annoyance,
+            "profile": profile, "annoyance": annoyance, "mood_tier": annoyance_tier(annoyance),
+            "shape_pinned": is_eye_shape_pinned(self.settings["shape"]),
             "pointer": pointer, "face": (wx + self.FACE_CENTER[0], wy + self.FACE_CENTER[1]), "inertia": inertia,
         })
-        st = self._visual_state(now, pointer)
+        st = self._visual_state(now, pointer, profile_mood)
         self._st = st
         if self._mode == "handle" and not self._anim_on and st["hover"] != self._notch_wide:
             self._notch_wide = st["hover"]
@@ -2927,110 +3026,138 @@ class LayeredMishWindow(RobotFaceWindow):
     # ------------------------------------------------------------------ layers (each returns a w x h RGBA)
     def _draw_body(self, w, h):
         st = self._st
-        lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        lay = self._frame_buffer("body", w, h)
         if not st:
             return lay
-        S = _SS
         ox, oy = (w - self.SIZE[0]) // 2, (h - self.SIZE[1]) // 2
         rgb = st["rgb"]
 
-        def put(layer, img, x, y):
-            tmp = Image.new("RGBA", layer.size, (0, 0, 0, 0))
-            tmp.paste(img, (int(x), int(y)))
-            return Image.alpha_composite(layer, tmp)
-
         body, bmask = self._body_sprite(st["breath"])
         bx, by = ox + self.BODY_RECT[0] - self.BODY_PAD, oy + self.BODY_RECT[1] - self.BODY_PAD
-        lay = put(lay, body, bx, by)
+        lay.alpha_composite(body, (bx, by))
 
-        el = Image.new("RGBA", (w, h), (0, 0, 0, 0))                     # eyes + bloom + emote, clipped to the body
-        el = put(el, self._halo(rgb), ox + 120 - HALO_W // 2, oy + EYE_CY - HALO_H // 2)
+        el = self._frame_buffer("face", *bmask.size)
+        fx, fy = ox - bx, oy - by
+        if st["eyes"]:
+            el.alpha_composite(self._halo(rgb), (fx + 120 - HALO_W // 2, fy + EYE_CY - HALO_H // 2))
         for spec, cx, cy in st["eyes"]:
             spr = self._eye_sprite(spec, rgb)
-            el = put(el, spr, ox + cx - spr.width // 2, oy + cy - spr.height // 2)
+            el.alpha_composite(spr, (fx + cx - spr.width // 2, fy + cy - spr.height // 2))
         if st["emote"]:
             name, bounce = st["emote"]
             spec, ecx, ecy = st["eyes"][1]
             ed = ImageDraw.Draw(el)
             gcol = ((255, 122, 200) if name == "heart" else rgb) + (255,)
-            gx0, gy0 = ox + ecx + spec[1] // 2 + 10, oy + ecy - spec[2] // 2 - 4 + bounce * 2
+            gx0, gy0 = fx + ecx + spec[1] // 2 + 10, fy + ecy - spec[2] // 2 - 4 + bounce * 2
             for r, row in enumerate(GLYPHS[name]):
                 for c, ch in enumerate(row):
                     if ch == "#":
                         ed.rectangle((gx0 + c * 3, gy0 + r * 3, gx0 + c * 3 + 2, gy0 + r * 3 + 2), fill=gcol)
-        clip = Image.new("L", (w, h), 0)
-        clip.paste(bmask, (bx, by))
-        el.putalpha(ImageChops.multiply(el.getchannel("A"), clip))
-        lay = Image.alpha_composite(lay, el)
+        self._draw_sleep_mask(el, fx + self.FACE_CENTER[0], fy + EYE_CY, 1.0, "float")
+        el.putalpha(ImageChops.multiply(el.getchannel("A"), bmask))
+        lay.alpha_composite(el, (bx, by))
 
-        if st["zzz"] is not None:                                         # floats outside the body, top right
-            bob = st["zzz"]
-            zl = Image.new("RGBA", (44 * S, 36 * S), (0, 0, 0, 0))
-            zd = ImageDraw.Draw(zl)
-            zd.text((2 * S, (14 + bob) * S), "Z", font=_font(16), fill=(148, 163, 184, 255))
-            zd.text((22 * S, (2 + bob) * S), "z", font=_font(11), fill=(148, 163, 184, 255))
-            lay = put(lay, zl.resize((44, 36), Image.Resampling.LANCZOS), ox + 172, oy + 2)
+        if st["zzz"] is not None:
+            lay.alpha_composite(self._zzz_sprite(), (ox + 172, oy + 2 + st["zzz"]))
         text, scol = st["status"]
         spr = self._status_sprite(text, scol)
-        lay = put(lay, spr, ox + 120 - spr.width // 2, oy + 73 - spr.height // 2)
+        lay.alpha_composite(spr, (ox + 120 - spr.width // 2, oy + 73 - spr.height // 2))
         if st["hover"] and text != "sleeping":
-            lay = put(lay, self._gear_sprite(rgb), ox + self.GEAR_RECT[0], oy + self.GEAR_RECT[1])
+            lay.alpha_composite(self._gear_sprite(rgb), (ox + self.GEAR_RECT[0], oy + self.GEAR_RECT[1]))
         return lay
 
-    def _draw_handle(self, w, h):
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _zzz_sprite():
         S = _SS
-        lay = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+        layer = Image.new("RGBA", (44 * S, 36 * S))
+        draw = ImageDraw.Draw(layer)
+        draw.text((2 * S, 14 * S), "Z", font=_font(16), fill=(148, 163, 184, 255))
+        draw.text((22 * S, 2 * S), "z", font=_font(11), fill=(148, 163, 184, 255))
+        return layer.resize((44, 36), Image.Resampling.LANCZOS)
+
+    @staticmethod
+    @lru_cache(maxsize=64)
+    def _handle_label(text):
+        S, h = _SS, 18
+        font = _font(11)
+        w = math.ceil(font.getlength(text) / S) + 6
+        layer = Image.new("RGBA", (w * S, h * S))
+        ImageDraw.Draw(layer).text((w * S / 2, h * S / 2), text, font=font,
+                                   fill=(226, 232, 240, 255), anchor="mm")
+        return layer.resize((w, h), Image.Resampling.LANCZOS)
+
+    @staticmethod
+    @lru_cache(maxsize=16)
+    def _handle_dot(rgb):
+        S, size = _SS, 24
+        box = (9 * S, 9 * S, 15 * S, 15 * S)
+        dot = Image.new("RGBA", (size * S, size * S))
+        ImageDraw.Draw(dot).ellipse(box, fill=rgb + (255,))
+        dot = dot.filter(ImageFilter.GaussianBlur(3 * S))
+        dot.putalpha(dot.getchannel("A").point(lambda v: min(255, v * 2)))
+        ImageDraw.Draw(dot).ellipse(box, fill=rgb + (255,))
+        return dot.resize((size, size), Image.Resampling.LANCZOS)
+
+    def _draw_handle(self, w, h):
+        layer = self._frame_buffer("handle", w, h)
         st = self._st
         if st:
-            rgb = st["rgb"]
             text, scol = st["status"]
-            self._mini_eyes(lay, S, 16, h / 2.0, 5, 10, 5, rgb, st["blink"])
-            d = ImageDraw.Draw(lay)
-            try:
-               d.text((w / 2.0 * S, h / 2.0 * S), text, font=_font(11), fill=(226, 232, 240, 255), anchor="mm")
-            except Exception:
-                pass
-            dx, dy = w - 16, h / 2.0
-            glow = Image.new("RGBA", lay.size, (0, 0, 0, 0))
-            ImageDraw.Draw(glow).ellipse(((dx - 3) * S, (dy - 3) * S, (dx + 3) * S, (dy + 3) * S), fill=scol + (255,))
-            glow = glow.filter(ImageFilter.GaussianBlur(3 * S))
-            glow.putalpha(glow.getchannel("A").point(lambda v: min(255, v * 2)))
-            lay = Image.alpha_composite(lay, glow)
-            ImageDraw.Draw(lay).ellipse(((dx - 3) * S, (dy - 3) * S, (dx + 3) * S, (dy + 3) * S), fill=scol + (255,))
-        return lay.resize((w, h), Image.Resampling.LANCZOS)
+            self._mini_eyes(layer, 24, h / 2, self.HANDLE_EYE_SCALE)
+            self._draw_sleep_mask(layer, 24, h / 2, self.HANDLE_EYE_SCALE, "handle")
+            label = self._handle_label(text)
+            layer.alpha_composite(label, ((w - label.width) // 2, (h - label.height) // 2))
+            dot = self._handle_dot(scol)
+            layer.alpha_composite(dot, (w - 16 - dot.width // 2, (h - dot.height) // 2))
+        return layer
+
+    @staticmethod
+    @lru_cache(maxsize=8)
+    def _island_chrome(w, h, tx, lines, rgb):
+        S = _SS
+        layer = Image.new("RGBA", (w * S, h * S))
+        draw = ImageDraw.Draw(layer)
+        sx = 44 * S
+        draw.rounded_rectangle((sx, 14 * S, sx + 1.5 * S, (h - 14) * S), radius=S / 2,
+                               fill=rgb + (110,))
+        line_h = LayeredMishWindow.LINE_H
+        ty = (h - len(lines) * line_h) / 2
+        px = LayeredMishWindow.ISLAND_FONT_PX
+        for i, line in enumerate(lines):
+            x, y = tx, ty + i * line_h
+            for emoji, run in _runs(line):
+                font = _font(px, emoji) or _font(px)
+                try:
+                    if emoji:
+                        draw.text((x * S, y * S), run, font=font, embedded_color=True)
+                    else:
+                        draw.text((x * S, y * S), run, font=font, fill=LayeredMishWindow.TEXT_COL + (255,))
+                except Exception:
+                    pass
+                x += font.getlength(run) / S
+        return layer.resize((w, h), Image.Resampling.LANCZOS)
 
     def _draw_island(self, w, h):
-        S = _SS
-        lay = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+        layer = self._frame_buffer("island", w, h)
         isl, st = self._isl, self._st
         if isl:
-            ox, oy = (w - isl["w"]) / 2.0, (h - isl["h"]) / 2.0
-            rgb, blink = (st["rgb"], st["blink"]) if st else ((255, 255, 255), 0.0)
-            self._mini_eyes(lay, S, ox + 16, oy + isl["h"] / 2.0, 6, 12, 6, rgb, blink)
-            d = ImageDraw.Draw(lay)
-            sx = (ox + 44) * S
-            d.rounded_rectangle((sx, (oy + 14) * S, sx + 1.5 * S, (oy + isl["h"] - 14) * S), radius=S / 2.0,
-                                fill=rgb + (110,))
-            tx = ox + isl["tx"] 
-            ty = oy + (isl["h"] - len(isl["lines"]) * self.LINE_H) / 2.0
-            px = self.ISLAND_FONT_PX
-            for i, line in enumerate(isl["lines"]):
-                x, y = tx, ty + i * self.LINE_H
-                for emoji, run in _runs(line):
-                    f = _font(px, emoji) or _font(px)
-                    try:
-                        if emoji:
-                            d.text((x * S, y * S), run, font=f, embedded_color=True)
-                        else:
-                            d.text((x * S, y * S), run, font=f, fill=self.TEXT_COL + (255,))
-                    except Exception:
-                        pass
-                    x += f.getlength(run) / S
-        return lay.resize((w, h), Image.Resampling.LANCZOS)
+            iw, ih = isl["w"], isl["h"]
+            ox, oy = (w - iw) // 2, (h - ih) // 2
+            rgb = st["rgb"] if st else (255, 255, 255)
+            self._mini_eyes(layer, ox + 25, oy + ih / 2, self.ISLAND_EYE_SCALE)
+            self._draw_sleep_mask(layer, ox + 25, oy + ih / 2, self.ISLAND_EYE_SCALE, "island")
+            chrome = self._island_chrome(iw, ih, isl["tx"], tuple(isl["lines"]), rgb)
+            layer.alpha_composite(chrome, (ox, oy))
+        return layer
 
     def _shell(self, w, h):
         """Notch / island body: black rounded shell + translucent hairline. Returns (shell RGBA, clip mask L)."""
         g, S = self._g, _SS
+        key = (w, h, g["r"], g["flat"])
+        if self._shell_cache is not None and self._shell_cache[0] == key:
+            return self._shell_cache[1]
+
         W, H = w * S, h * S
         top = -g["flat"] * 2 * g["r"] * S                           # flat top = rounding pushed off the screen edge
         rad = max(0.0, min(g["r"] * S, (W - 1) / 2.0, (H - 1 - top) / 2.0))
@@ -3040,23 +3167,30 @@ class LayeredMishWindow(RobotFaceWindow):
         shell = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         ImageDraw.Draw(shell).rounded_rectangle(box, radius=rad, fill=NOTCH_BG + (255,),
                                                 outline=(255, 255, 255, 46), width=S)
-        return (shell.resize((w, h), Image.Resampling.LANCZOS), mask.resize((w, h), Image.Resampling.LANCZOS))
+        sprites = (shell.resize((w, h), Image.Resampling.LANCZOS),
+                   mask.resize((w, h), Image.Resampling.LANCZOS))
+        self._shell_cache = (key, sprites)
+        return sprites
 
     def _compose(self):
         g, wt = self._g, self._wt
         w, h = max(1, int(round(g["w"]))), max(1, int(round(g["h"])))
-        out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        out = self._frame_buffer("output", w, h)
         if wt["body"] > 0.01:                                        # floating: no box at all
-            out = Image.alpha_composite(out, _fade(self._draw_body(w, h), wt["body"]))
+            out.alpha_composite(_fade(self._draw_body(w, h), wt["body"]))
         sw = 1.0 - wt["body"]
         if sw > 0.01:
             shell, mask = self._shell(w, h)
-            dock = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            dock = self._frame_buffer("dock", w, h)
             for name, draw in (("island", self._draw_island), ("handle", self._draw_handle)):
                 if wt[name] > 0.01:
-                    dock = Image.alpha_composite(dock, _fade(draw(w, h), wt[name]))
+                    dock.alpha_composite(_fade(draw(w, h), wt[name]))
             dock.putalpha(ImageChops.multiply(dock.getchannel("A"), mask))
-            out = Image.alpha_composite(out, _fade(Image.alpha_composite(shell, dock), sw))
+            if sw >= 0.99:
+                out.alpha_composite(shell)
+                out.alpha_composite(dock)
+            else:
+                out.alpha_composite(_fade(Image.alpha_composite(shell, dock), sw))
         self._sf.attach(self.root)
         self._sf.upload(out)
         self._frame_ready = True
@@ -3080,7 +3214,6 @@ class LayeredMishWindow(RobotFaceWindow):
         elif idle_t < AUTO_SLEEP_TIMEOUT and self.is_sleeping:
             self.is_sleeping = False
             self._wma_proxy("-alpha", self.settings["opacity"])
-            self.eyes.set_expression("surprised", 1.2)
             self.mish.react_async("wake")
 
     def on_drag(self, event):

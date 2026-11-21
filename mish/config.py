@@ -39,7 +39,7 @@ REACTION_COOLDOWN = 45           # seconds between window-switch reactions
 
 AMBIENT_MIN_GAP = 90             # minimum seconds between any unsolicited popups
 BRAIN_IDLE_UNLOAD_S = 15 * 60    # release the auto-mode GGUF after 15m idle
-__version__ = "0.5.50b"
+__version__ = "0.5.51a"
 DEFAULT_SETTINGS = {"dev": 0, "brain_mode": "auto", "profile": "neutral", "profile_auto": 1}
 HOTKEY_MOD = 0x0001 | 0x4000     # MOD_ALT | MOD_NOREPEAT
 HOTKEY_VK = 0x4D                 # 'M' -> Alt+M global summon
