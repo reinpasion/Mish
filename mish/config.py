@@ -41,7 +41,7 @@ REACTION_COOLDOWN = 45           # seconds between window-switch reactions
 
 AMBIENT_MIN_GAP = 90             # minimum seconds between any unsolicited popups
 BRAIN_IDLE_UNLOAD_S = 15 * 60    # unload main brain to RAM after 15m idle
-__version__ = "0.5.41 (beta)"
+__version__ = "0.5.41"
 DEFAULT_SETTINGS = {"dev": 0}        # 1 = Dev Console auto-opens and fast timers are on
 HOTKEY_MOD = 0x0001 | 0x4000     # MOD_ALT | MOD_NOREPEAT
 HOTKEY_VK = 0x4D                 # 'M' -> Alt+M global summon
@@ -103,7 +103,8 @@ SLACK_STREAK_S = 90              # continuous seconds on a slack category before
 FOCUS_SLACK_STREAK_S = 15        # same, but during focus mode
 SLACK_BUMP_GAP = 45              # min seconds between two slack bumps
 SCOLD_LLM_GAP = 120              # at fed_up: at most one LLM-written scolding per this many seconds
-CANNED_FIRST_EVENTS = {"switch", "slacking", "gaming", "nag", "pester"}   # rendered from templates, no LLM
+CANNED_FIRST_EVENTS = {"switch", "slacking", "gaming", "nag", "pester"}
+CANNED_ONLY_EVENTS = {"observe", "wake", "reminder", "focus_punish", "focus_done", "heavy_end"}
 DEV_SLACK_STREAK_S = 5
 DEV_FOCUS_SLACK_STREAK_S = 3
 DEV_SLACK_BUMP_GAP = 5

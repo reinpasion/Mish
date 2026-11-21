@@ -938,6 +938,125 @@ class RoundedShell(tk.Canvas):
         except tk.TclError:
             pass
 
+def render_check(size: int, c: dict, hover: bool = False, press: bool = False):
+    """Task completion circle: hollow ring -> accent ring + faint check on hover -> filled check on press."""
+    img, d, S = _aa(size, size)
+    m = 1.5
+    box = (m * S, m * S, (size - m) * S - 1, (size - m) * S - 1)
+    if press:
+        d.ellipse(box, fill=c["accent"])
+    elif hover:
+        d.ellipse(box, fill=_mixhex(c["card"], c["accent"], 0.22), outline=c["accent"], width=int(1.5 * S))
+    else:
+        d.ellipse(box, outline=_mixhex(c["muted"], c["card"], 0.15), width=int(1.5 * S))
+    if hover or press:
+        pts = [(0.30 * size * S, 0.52 * size * S), (0.44 * size * S, 0.66 * size * S), (0.72 * size * S, 0.36 * size * S)]
+        d.line(pts, fill=c["on_accent"] if press else c["accent"], width=int(1.8 * S), joint="curve")
+    return _down(img, size, size)
+
+
+def render_swatch(size: int, color: str, selected: bool, hover: bool, c: dict):
+    img, d, S = _aa(size, size)
+    cx = size / 2.0
+    g = Image.new("L", img.size, 0)
+    ImageDraw.Draw(g).ellipse(((cx - 9) * S, (cx - 9) * S, (cx + 9) * S, (cx + 9) * S), fill=255)
+    g = g.filter(ImageFilter.GaussianBlur(3 * S)).point(lambda v: int(v * (0.25 if c["light"] else 0.45)))
+    glow = Image.new("RGBA", img.size, _hex_rgb(color) + (255,))
+    glow.putalpha(g)
+    img = Image.alpha_composite(img, glow)
+    d = ImageDraw.Draw(img)
+    r = 8.0 if hover else 7.0
+    d.ellipse(((cx - r) * S, (cx - r) * S, (cx + r) * S, (cx + r) * S), fill=color, outline=c["line"], width=S)
+    if selected:
+        r2 = size / 2.0 - 1.5
+        d.ellipse(((cx - r2) * S, (cx - r2) * S, (cx + r2) * S, (cx + r2) * S), outline=c["text"], width=int(1.6 * S))
+    return _down(img, size, size)
+
+
+def render_segmented(w: int, h: int, labels, sel: int, c: dict, hover: int = -1, px: float = 9):
+    img, d, S = _aa(w, h)
+    d.rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=h * S / 2.0, fill=c["bg"], outline=c["line"], width=S)
+    n = max(1, len(labels))
+    seg = (w - 6) / n
+    f = _font(px)
+    for i, lab in enumerate(labels):
+        x0 = 3 + i * seg
+        box = (x0 * S, 3 * S, (x0 + seg) * S - 1, (h - 3) * S - 1)
+        rad = (h - 6) * S / 2.0
+        if i == sel:
+            d.rounded_rectangle(box, radius=rad, fill=c["accent"])
+            fg = c["on_accent"]
+        else:
+            if i == hover:
+                d.rounded_rectangle(box, radius=rad, fill=_mixhex(c["bg"], c["text"], 0.10))
+            fg = c["text"]
+        cx, cy = (x0 + seg / 2.0) * S, h * S / 2.0
+        try:
+            d.text((cx, cy), lab, font=f, fill=fg, anchor="mm")
+        except Exception:
+            d.text((cx - f.getlength(lab) / 2.0, cy - px * S * 0.6), lab, font=f, fill=fg)
+    return _down(img, w, h)
+
+
+def render_mini_preview(w: int, h: int, color: str, shape: str, mood_on: bool, c: dict):
+    """Live preview for the Customize panel: Mish's always-dark squircle + eyes, and the mood-tint legend."""
+    img, d, S = _aa(w, h)
+    bw, bh, pad = 144, 76, 3
+    cx, cy = 94.0, h / 2.0
+    lw, lh = (bw + 2 * pad) * S, (bh + 2 * pad) * S
+    mask = Image.new("L", (lw, lh), 0)
+    ImageDraw.Draw(mask).polygon(_squircle_points(lw / 2.0, lh / 2.0, bw / 2.0 * S, bh / 2.0 * S), fill=255)
+    inner = mask.filter(ImageFilter.MinFilter(2 * S + 1))
+    body = Image.new("RGBA", (lw, lh), NOTCH_BG + (255,))
+    body.putalpha(mask)
+    rim = Image.new("RGBA", (lw, lh), (255, 255, 255, 255))
+    rim.putalpha(ImageChops.subtract(mask, inner).point(lambda v: int(v * 0.18)))
+    grad = ImageChops.invert(Image.linear_gradient("L")).resize((lw, 18 * S), Image.Resampling.BILINEAR)
+    spec = Image.new("L", (lw, lh), 0)
+    spec.paste(grad, (0, pad * S))
+    spec = ImageChops.multiply(ImageChops.multiply(spec, inner).filter(ImageFilter.GaussianBlur(S)), mask)
+    hl = Image.new("RGBA", (lw, lh), (255, 255, 255, 255))
+    hl.putalpha(spec.point(lambda v: int(v * 0.16)))
+    sq = Image.alpha_composite(Image.alpha_composite(body, rim), hl)
+
+    ew, eh, rad = SHAPE_DIMS.get(shape, SHAPE_DIMS["pill"])
+    rgb = _hex_rgb(color)
+    em = Image.new("L", (lw, lh), 0)
+    ed = ImageDraw.Draw(em)
+    for sgn in (-1, 1):
+        ex, ey = lw / 2.0 + sgn * (10 + ew / 2.0) * S, lh / 2.0 - 6 * S
+        ed.rounded_rectangle((ex - ew * S / 2.0, ey - eh * S / 2.0, ex + ew * S / 2.0 - 1, ey + eh * S / 2.0 - 1),
+                             radius=min(rad * S, ew * S / 2.0, eh * S / 2.0), fill=255)
+    glow = Image.new("RGBA", (lw, lh), rgb + (255,))
+    glow.putalpha(em.filter(ImageFilter.GaussianBlur(3.5 * S)).point(lambda v: int(v * 0.55)))
+    eyes = Image.new("RGBA", (lw, lh), rgb + (255,))
+    eyes.putalpha(em)
+    sq = Image.alpha_composite(sq, glow)
+    sq = Image.alpha_composite(sq, eyes)
+    sd = ImageDraw.Draw(sq)
+    f = _font(9)
+    try:
+        sd.ellipse((lw / 2.0 - 26 * S, lh / 2.0 + 21 * S, lw / 2.0 - 20 * S, lh / 2.0 + 27 * S), fill=(255, 255, 255, 255))
+        sd.text((lw / 2.0 - 14 * S, lh / 2.0 + 24 * S), "idle", font=f, fill=(226, 232, 240, 255), anchor="lm")
+    except Exception:
+        pass
+    img.alpha_composite(sq, (int((cx - bw / 2.0 - pad) * S), int((cy - bh / 2.0 - pad) * S)))
+
+    d = ImageDraw.Draw(img)                                           # mood legend (dimmed when tints are off)
+    items = (("happy", STATE_RGB["happy"]), ("curious", STATE_RGB["curious"]),
+             ("alert", STATE_RGB["scared"]), ("sleepy", STATE_RGB["sleepy"]))
+    off = _hex_rgb(_mixhex(c["muted"], c["card"], 0.45))
+    for i, (name, col) in enumerate(items):
+        y = h / 2.0 - 25.5 + i * 17
+        colr = col if mood_on else off
+        d.ellipse((190 * S, (y - 4) * S, 198 * S, (y + 4) * S), fill=colr)
+        try:
+            d.text((206 * S, y * S), name, font=f, fill=c["text"] if mood_on else c["muted"], anchor="lm")
+        except Exception:
+            d.text((206 * S, (y - 6) * S), name, font=f, fill=c["text"] if mood_on else c["muted"])
+    return _down(img, w, h)
+
+
 class CheckCircle(_PilCanvas):
     """20px completion circle for task rows. command() fires on a click released inside the circle."""
 
@@ -1918,7 +2037,8 @@ class RobotFaceWindow:
             self._place(x0, y0, base)
             self.errand = None
             self.eyes.blink_now(time.time(), 0.2)
-            self.speak(f"Opening {app}." if ok else f"I couldn't search for {app}.", "happy" if ok else "sad")
+            self.speak(f"Submitted a Windows search for {app}." if ok else f"I couldn't search for {app}.",
+                       "happy" if ok else "sad")
         self._animate(self.ERRAND_RETURN_S, frame, done)
 
     # ---- theme -----------------------------------------------------------------------
@@ -2222,7 +2342,7 @@ class RobotFaceWindow:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
-        self.mish.react_async("focus_punish", window_name[:40], force=True)
+        threading.Thread(target=self.mish.focus_punish_say, args=(window_name,), daemon=True).start()
 
     def trigger_dizzy_state(self):
         self.is_dizzy = True
@@ -3048,7 +3168,7 @@ class LayeredMishWindow(RobotFaceWindow):
     def _apply(self, x=None, y=None):
         if not self._frame_ready:
             self._compose()
-        self._sf.present(x, y, self._alpha)
+        return self._sf.present(x, y, self._alpha)
 
     # ------------------------------------------------------------------ overrides of the old canvas drawing
     def draw_squircle_background(self):
@@ -3070,10 +3190,10 @@ class LayeredMishWindow(RobotFaceWindow):
 
     # ------------------------------------------------------------------ cancellable morph animation
     def _morph(self, mode: str, seconds: float, done=None, spring: bool = False):
-        """Animate the window (position, size, corner radius, content cross-fade) to `mode`."""
-        src_g, (sx, sy) = dict(self._g), self._win_xy()
-        src_wt, dst_wt = dict(self._wt), self._weights(mode)
-        dst = self._target(mode)
+        """Animate the layered surface and commit Tk geometry at the end."""
+        src_mode, src_g, src_wt = self._mode, dict(self._g), dict(self._wt)
+        sx, sy = self._win_xy()
+        dst, dst_wt = self._target(mode), self._weights(mode)
         self._anim_tok += 1
         tok = self._anim_tok
         self._mode = mode
@@ -3082,8 +3202,8 @@ class LayeredMishWindow(RobotFaceWindow):
 
         def step():
             if tok != self._anim_tok:
-                return                                               # superseded by a newer animation
-            t = min(1.0, (time.perf_counter() - t0) / seconds)
+                return
+            t = min(1.0, (time.perf_counter() - t0) / seconds) if seconds > 0 else 1.0
             e = ease_out_back(t, 0.7) if spring else smoothstep(t)
             f = smoothstep(t)
             self._g = {k: src_g[k] + (dst[k] - src_g[k]) * e for k in ("w", "h", "r", "flat")}
@@ -3092,20 +3212,46 @@ class LayeredMishWindow(RobotFaceWindow):
             x = int(round(sx + (dst["x"] - sx) * e))
             y = int(round(sy + (dst["y"] - sy) * e))
             try:
-                self.root.geometry(f"{int(round(self._g['w']))}x{int(round(self._g['h']))}+{x}+{y}")
+                if t < 1.0:
+                    self._compose()
+                    self._apply(x, y)
+                    self.root.after(12, step)
+                    return
+
+                w, h = int(round(self._g["w"])), int(round(self._g["h"]))
+                expected = (x, y, x + w, y + h)
+                self.root.geometry(f"{w}x{h}")
+                self.root.update_idletasks()
+                if tok != self._anim_tok:
+                    return
                 self._compose()
-                self._apply(x, y)
+                for _ in range(2):
+                    if self._apply(x, y) and self._sf.bounds() == expected:
+                        break
+                else:
+                    log("morph presentation failed:", mode, expected, self._sf.bounds())
+                    self._mode, self._g, self._wt = src_mode, src_g, src_wt
+                    self._anim_on = False
+                    self._invalidate()
+                    self.root.geometry(f"{round(src_g['w'])}x{round(src_g['h'])}")
+                    self.root.update_idletasks()
+                    if tok == self._anim_tok:
+                        self._compose()
+                        self._apply(sx, sy)
+                    return
             except tk.TclError:
-                self._anim_on = False
+                if tok == self._anim_tok:
+                    self._mode, self._g, self._wt = src_mode, src_g, src_wt
+                    self._anim_on = False
+                    self._invalidate()
                 return
-            if t < 1.0:
-                self.root.after(12, step)
-            else:
-                self._anim_on = False
-                self._invalidate()
-                if done:
-                    done()
+            self._anim_on = False
+            self._invalidate()
+            if done:
+                done()
+
         step()
+
     # ------------------------------------------------------------------ top handle
     def tuck_to_top(self):
         if self._mode != "float" or self.errand:
@@ -3506,11 +3652,24 @@ def main():
     except Exception:
         pass
 
+    timer_resolution = False
+    try:
+        try:
+            timer_resolution = ctypes.windll.winmm.timeBeginPeriod(1) == 0
+        except OSError as error:
+            log("Windows timer resolution unavailable:", repr(error))
+        _run_app()
+    finally:
+        if timer_resolution:
+            ctypes.windll.winmm.timeEndPeriod(1)
+
+
+def _run_app():
     ensure_portable_setup(user_data_dir())
     ui_queue: queue.Queue = queue.Queue()
     mish = Mish(ui_queue)
-    root = tk.Tk()
-    LayeredMishWindow(root, mish, ui_queue)
+    icon = None
+
 
     def quit_app(icon=None, _item=None):
         mish.shutdown()
@@ -3521,28 +3680,30 @@ def main():
                 pass
         ui_queue.put(("quit",))
 
-    root.protocol("WM_DELETE_WINDOW", quit_app)
-
-    icon = pystray.Icon(
-        "Mish", create_icon_image(), "Mish",
-        menu=pystray.Menu(
-            pystray.MenuItem("Open Mish", lambda i, it: ui_queue.put(("show",)), default=True),
-            pystray.MenuItem("Remind me now", lambda i, it: mish.react_async("reminder")),
-            pystray.MenuItem(f"Start focus ({FOCUS_DEFAULT_MIN}m)", lambda i, it: mish.say(mish.start_focus(FOCUS_DEFAULT_MIN))),
-            pystray.MenuItem("Stop focus", lambda i, it: mish.say(mish.stop_focus())),
-            pystray.MenuItem("Focus status", lambda i, it: mish.say(f"Focus: {'ON' if mish.in_focus() else 'OFF'}")),
-            pystray.MenuItem("Look screen", lambda i, it: mish.observe_async(force=True)),
-            pystray.MenuItem("Exit", quit_app),
-        ),
-    )
-
-    for target in (mish.watcher_loop, mish.scheduler_loop, mish.timer_loop, mish.observe_loop, mish.pester_loop,
-                   mish.hardware_loop, mish.startup_briefing):
-        threading.Thread(target=target, daemon=True).start()
-    threading.Thread(target=_hotkey_loop, args=(ui_queue, mish.stop_event), daemon=True).start()
-    threading.Thread(target=icon.run, daemon=True).start()
-
     try:
+        root = tk.Tk()
+        LayeredMishWindow(root, mish, ui_queue)
+        root.protocol("WM_DELETE_WINDOW", quit_app)
+
+        icon = pystray.Icon(
+            "Mish", create_icon_image(), "Mish",
+            menu=pystray.Menu(
+                pystray.MenuItem("Open Mish", lambda i, it: ui_queue.put(("show",)), default=True),
+                pystray.MenuItem("Remind me now", lambda i, it: mish.react_async("reminder")),
+                pystray.MenuItem(f"Start focus ({FOCUS_DEFAULT_MIN}m)", lambda i, it: mish.say(mish.start_focus(FOCUS_DEFAULT_MIN))),
+                pystray.MenuItem("Stop focus", lambda i, it: mish.say(mish.stop_focus())),
+                pystray.MenuItem("Focus status", lambda i, it: mish.say(f"Focus: {'ON' if mish.in_focus() else 'OFF'}")),
+                pystray.MenuItem("Look screen", lambda i, it: mish.observe_async(force=True)),
+                pystray.MenuItem("Exit", quit_app),
+            ),
+        )
+
+        for target in (mish.watcher_loop, mish.scheduler_loop, mish.timer_loop, mish.observe_loop, mish.pester_loop,
+                       mish.hardware_loop, mish.startup_briefing):
+            threading.Thread(target=target, daemon=True).start()
+        threading.Thread(target=_hotkey_loop, args=(ui_queue, mish.stop_event), daemon=True).start()
+        threading.Thread(target=icon.run, daemon=True).start()
+
         root.mainloop()
     finally:
         quit_app(icon)

@@ -79,8 +79,7 @@ class BlackboardSync:
             if prev:
                 task_obj = pending_by_id.get(prev.get("task_id"))
                 if task_obj and task_obj.get("due") != due_iso:
-                    task_obj["due"] = due_iso
-                    store.save()
+                    store.reschedule_task(task_obj, due_iso)
                     self._seen[uid] = {"task_id": task_obj["id"], "due": due_iso}
                 continue
 

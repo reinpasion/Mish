@@ -306,20 +306,26 @@ def _tap_key(vk: int):
     _key_event(vk, up=True)
 
 
-def _type_text(text: str, delay: float = 0.04):
-    """Type text into whatever has focus, one key at a time (handles Shift for capitals and symbols)."""
-    ctypes.windll.user32.VkKeyScanW.restype = ctypes.c_short      # so "no such key" really is -1
+def _type_text(text: str, delay: float = 0.04, focus_check=None) -> bool:
+    """Type a string while the optional foreground check continues to pass."""
+    user32 = ctypes.windll.user32
+    user32.VkKeyScanW.restype = ctypes.c_short
     for ch in text:
-        vk = ctypes.windll.user32.VkKeyScanW(ord(ch))
-        if vk != -1:
-            code, shift = vk & 0xFF, (vk >> 8) & 1
-            if shift:
-                _key_event(0x10)                                    # Shift down
+        if focus_check is not None and not focus_check():
+            return False
+        key = user32.VkKeyScanW(ord(ch))
+        if key == -1 or (key >> 8) & ~1:
+            return False  # This keyboard layout needs a modifier we do not send.
+        code, shift = key & 0xFF, (key >> 8) & 1
+        if shift:
+            _key_event(0x10)
+        try:
             _tap_key(code)
+        finally:
             if shift:
                 _key_event(0x10, up=True)
         time.sleep(delay)
-
+    return True
 
 def capture_screen() -> bytes | None:
     """PNG of the active window (or the whole desktop), shrunk for the vision model."""
@@ -466,6 +472,13 @@ class Store:
         self._dirty = False
         self.data = self._load()
         self.on_complete = None
+        self._changes = threading.Condition(self.lock)
+        self._revision = self._written_revision = 0
+        self._pending = None
+        self._write_error = None
+        self._closing = False
+        self._writer = threading.Thread(target=self._write_loop, name="mish-store-writer", daemon=True)
+        self._writer.start()
         self.save()
 
     @staticmethod
@@ -497,29 +510,106 @@ class Store:
             data["facts"] = {}
         return data
 
-    def save(self):
-        with self.lock:
+    def _check_open(self):
+        if self._closing:
+            raise RuntimeError("The memory store is closing")
+
+    def _queue_snapshot(self):
+        payload = json.dumps(self.data, indent=2, ensure_ascii=False).encode("utf-8")
+        self._revision += 1
+        self._pending = (self._revision, payload)
+        self._dirty = False
+        self._changes.notify_all()
+        return self._revision
+
+    def _wait_written(self, revision: int, timeout: float):
+        with self._changes:
+            ready = self._changes.wait_for(
+                lambda: self._written_revision >= revision
+                or (self._write_error is not None and self._write_error[0] == self._revision),
+                timeout,
+            )
+            if not ready:
+                raise TimeoutError(f"Timed out saving memory revision {revision}")
+            if self._written_revision < revision:
+                raise OSError(f"Could not save memory revision {revision}") from self._write_error[1]
+
+    def save(self, wait: bool = False, timeout: float = 10.0):
+        """Queue the latest state. Synchronous callers must not hold store.lock."""
+        with self._changes:
+            self._check_open()
+            revision = self._queue_snapshot()
+        if wait:
+            self._wait_written(revision, timeout)
+
+    def close(self, timeout: float = 10.0):
+        """Reject new mutations, write the final snapshot, and join the writer."""
+        with self._changes:
+            if not self._closing:
+                self._queue_snapshot()
+                self._closing = True
+            revision = self._revision
+        self._writer.join(timeout)
+        if self._writer.is_alive():
+            raise TimeoutError(f"Timed out draining memory revision {revision}")
+        self._wait_written(revision, timeout=0)
+
+    def _write_loop(self):
+        while True:
+            with self._changes:
+                self._changes.wait_for(lambda: self._pending is not None or self._closing)
+                if self._pending is None:
+                    return
+                revision, payload = self._pending
+                self._pending = None
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                if self.path.exists():
-                    try:
-                        shutil.copy2(self.path, self.path.with_suffix(".json.bak"))
-                    except OSError:
-                        pass
-                tmp = self.path.with_suffix(".tmp")
-                payload = json.dumps(self.data, indent=2, ensure_ascii=False).encode("utf-8")
-                with open(tmp, "wb") as f:
-                    f.write(payload)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, self.path)
-                self._dirty = False
-            except Exception as e:
-                log("memory save failed:", repr(e))
+                self._write_snapshot(payload)
+            except Exception as error:
+                with self._changes:
+                    self._write_error = (revision, error)
+                    if revision == self._revision:
+                        self._dirty = True
+                    self._changes.notify_all()
+                log("memory save failed:", repr(error))
+            else:
+                with self._changes:
+                    self._written_revision = revision
+                    self._write_error = None
+                    self._changes.notify_all()
+
+    def _write_snapshot(self, payload: bytes):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                shutil.copy2(self.path, self.path.with_suffix(".json.bak"))
+            except OSError:
+                pass
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, self.path)
+
+    def clear_history(self) -> int:
+        with self.lock:
+            self._check_open()
+            count = len(self.data["chat_history"])
+            self.data["chat_history"] = []
+            self.save()
+            return count
+
+    def reschedule_task(self, task: dict, due: str):
+        with self.lock:
+            self._check_open()
+            if any(item is task for item in self.data["tasks"]) and not task["done"]:
+                task["due"] = due
+                self.save()
 
     # ---- tasks ----------------------------------------------------------------
     def add_task(self, text: str, due: datetime | None = None):
         with self.lock:
+            self._check_open()
             d = self.data
             if any(t["text"].lower() == text.lower() and not t["done"] for t in d["tasks"]):
                 return None
@@ -549,9 +639,10 @@ class Store:
 
     def complete(self, task: dict):
         with self.lock:
+            self._check_open()
             task["done"], task["done_at"] = True, now_iso()
             self.save()
-        cb = self.on_complete                     
+        cb = self.on_complete
         if cb:
             try:
                 cb(task)
@@ -560,6 +651,7 @@ class Store:
 
     def delete(self, task: dict):
         with self.lock:
+            self._check_open()
             if task in self.data["tasks"]:
                 self.data["tasks"].remove(task)
                 self.save()
@@ -579,6 +671,7 @@ class Store:
 
     def mark_nagged(self, task: dict):
         with self.lock:
+            self._check_open()
             task["nags"] += 1
             task["last_nag"] = now_iso()
             self.save()
@@ -591,6 +684,7 @@ class Store:
 
     def add_fact(self, text: str, strength: float = 3.0):
         with self.lock:
+            self._check_open()
             facts = self.data["facts"]
             facts[text] = facts.get(text, 0.0) + strength
             self.data["facts"] = dict(self.facts_sorted()[:FACT_LIMIT])
@@ -599,6 +693,7 @@ class Store:
     def forget_fact(self, ref: str):
         """Forget a fact by its number in `facts` or by part of its text. Returns the fact, or None."""
         with self.lock:
+            self._check_open()
             items = self.facts_sorted()
             ref = ref.strip().lower()
             if ref.isdigit():
@@ -613,6 +708,7 @@ class Store:
 
     def decay_facts(self, days: int = 1):
         with self.lock:
+            self._check_open()
             kept = {f: s - days for f, s in self.data["facts"].items() if s - days > 1.0}
             self.data["facts"] = kept
             self.save()
@@ -620,6 +716,7 @@ class Store:
     def run_daily_decay(self):
         """Fade unused facts by 1 per day. The last run is stored, so it survives restarts and long gaps."""
         with self.lock:
+            self._check_open()
             today = date.today()
             try:
                 last = date.fromisoformat(self.data.get("last_decay") or "")
@@ -634,11 +731,13 @@ class Store:
     # ---- chat history, screen notes, usage stats ------------------------------
     def add_history(self, role: str, content: str):
         with self.lock:
+            self._check_open()
             self.data["chat_history"] = (self.data["chat_history"] + [{"role": role, "content": content}])[-12:]
             self.save()
 
     def add_activity(self, text: str):
         with self.lock:
+            self._check_open()
             self.data["activity"] = (self.data["activity"] + [{"t": now_iso(), "text": text}])[-ACTIVITY_KEEP:]
             self.save()
 
@@ -647,13 +746,17 @@ class Store:
             day = date.today().isoformat()
             stats = self.data["stats"]
             if day not in stats:
-                stats[day] = {"work": 0.0, "slack": 0.0, "neutral": 0.0, "apps": {}}
+                empty = {"work": 0.0, "slack": 0.0, "neutral": 0.0, "apps": {}}
+                if self._closing:
+                    return empty
+                stats[day] = empty
                 for old in sorted(stats)[:-STATS_KEEP_DAYS]:
                     del stats[old]
             return stats[day]
 
     def record_usage(self, app: str, category: str, secs: float):
         with self.lock:
+            self._check_open()
             s = self.today_stats()
             s[category] += secs
             s["apps"][app] = s["apps"].get(app, 0.0) + secs
@@ -771,10 +874,15 @@ class _LayeredSurface:
         data = Image.merge("RGBA", (b, g, r, a)).tobytes()          # -> BGRA byte order
         ctypes.memmove(self.bits, data, len(data))
 
-    def rect(self):
+    def bounds(self):
         rc = _wt.RECT()
-        _U32.GetWindowRect(self.hwnd, ctypes.byref(rc))
-        return rc.left, rc.top
+        if self.hwnd and _U32.GetWindowRect(self.hwnd, ctypes.byref(rc)):
+            return rc.left, rc.top, rc.right, rc.bottom
+        return None
+
+    def rect(self):
+        bounds = self.bounds()
+        return bounds[:2] if bounds is not None else (0, 0)
 
     def present(self, x=None, y=None, alpha: float = 1.0):
         if not (self.hwnd and self.memdc):
