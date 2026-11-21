@@ -26,6 +26,7 @@ from plyer import notification
 
 try:
     from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import get_chat_completion_handler
 except ImportError:
     Llama = None
 
@@ -45,6 +46,9 @@ from .config import (
     BANG_HELP,
     BORED_AFTER,
     BRAIN_CTX,
+    BRAIN_CTX_LITE,
+    CONTEXT_CHARS_LITE,
+    CONTEXT_CHARS_MAIN,
     BRAIN_IDLE_UNLOAD_S,
     BREAK_DEFAULT_MIN,
     DATA_DIR,
@@ -53,7 +57,6 @@ from .config import (
     DROWSY_AFTER,
     EVENT_HINTS,
     EVENT_INSTRUCTIONS,
-    FACT_PROMPT_MIN,
     FOCUS_DEFAULT_MIN,
     PROFILE_CANNED_DEFAULTS,
     PROFILE_NAMES,
@@ -90,8 +93,8 @@ from .config import (
     DEV_WINDOW_SWITCH_CHANCE,
     __version__,
 )
+from .store import Store, task_due, task_source
 from .win_utils import (
-    Store,
     _key_event,
     _known_apps,
     _tap_key,
@@ -99,7 +102,6 @@ from .win_utils import (
     bundle_dir,
     capture_screen,
     clamp,
-    classify,
     fmt_due,
     fmt_dur,
     get_active_window_info,
@@ -192,14 +194,17 @@ def clean_reply(raw: str) -> str:
 class Brain:
     """Own one local GGUF. Reservations serialize model operations without holding a lock during them."""
 
-    def __init__(self, want: str = "auto", stop_event: threading.Event | None = None):
+    def __init__(self, want: str = "auto", stop_event: threading.Event | None = None, *,
+                 context_window: int = BRAIN_CTX):
         self.want = _brain_mode(want) or "auto"
+        self._preferred_context = context_window
+        self._loaded_context = None
         self.llm = None
         self.model_name = ""
         self.last_used = time.monotonic()
         self._retry_at = 0.0
         self._heavy = False
-        self._pending_auto_unload = False
+        self._pending_context_unload = False
         self._working = False
         self._state = threading.Condition()
         self._stop_event = stop_event if stop_event is not None else threading.Event()
@@ -217,7 +222,10 @@ class Brain:
         finally:
             if acquired:
                 with self._state:
-                    unload = self._pending_auto_unload and self.want == "auto" and self.available
+                    unload = self.available and (
+                        self._loaded_context != self.context_window
+                        or (self._pending_context_unload and self._loaded_context > BRAIN_CTX_LITE)
+                    )
                     if not unload:
                         self._release_operation()
                 if unload:
@@ -229,7 +237,7 @@ class Brain:
 
     def _release_operation(self):
         """Clear the reservation with _state held, after any deferred unload."""
-        self._pending_auto_unload = False
+        self._pending_context_unload = False
         self._working = False
         self._state.notify_all()
 
@@ -238,15 +246,15 @@ class Brain:
         return self.llm is not None
 
     @property
-    def paused(self) -> bool:
-        return self.want == "auto" and self._heavy
+    def context_window(self) -> int:
+        return min(self._preferred_context, BRAIN_CTX_LITE) if self._heavy else self._preferred_context
 
     def status_text(self) -> str:
         model = self.model_name
         state = f"loaded ({model})" if model else "unloaded"
         if self._heavy:
             state += ", heavy"
-        return f"Brain: {self.want} | {state}"
+        return f"Brain: {self.want} | {self.context_window} tokens | {state}"
 
     @staticmethod
     def has_vision() -> bool:
@@ -254,6 +262,7 @@ class Brain:
 
     def _unload(self):
         llm, self.llm = self.llm, None
+        self._loaded_context = None
         self.model_name = ""
         if llm is None:
             return
@@ -266,8 +275,14 @@ class Brain:
         log("brain: unloaded")
 
     def _load(self):
-        if (self._stop_event.is_set() or self.available or self.want == "off" or self.paused
-                or time.monotonic() < self._retry_at):
+        if self._stop_event.is_set() or self.want == "off":
+            return
+        context_window = self.context_window
+        if self.available:
+            if self._loaded_context == context_window:
+                return
+            self._unload()
+        if time.monotonic() < self._retry_at:
             return
         try:
             path = _pick_model()
@@ -278,13 +293,14 @@ class Brain:
             else:
                 threads = max(2, (os.cpu_count() or 4) // 2)
                 model_path = path.resolve().as_posix()
-                if self._stop_event.is_set() or self.paused:
+                if self._stop_event.is_set() or context_window != self.context_window:
                     return
-                self.llm = Llama(model_path=model_path, n_ctx=BRAIN_CTX,
+                self.llm = Llama(model_path=model_path, n_ctx=context_window,
                                  n_threads=threads, n_gpu_layers=0, embedding=False, verbose=False)
+                self._loaded_context = context_window
                 self.model_name = path.name
                 self.last_used = time.monotonic()
-                log("brain: loaded", path.name, f"context={BRAIN_CTX}")
+                log("brain: loaded", path.name, f"context={context_window}")
                 return
         except Exception as error:
             log("brain: load failed:", repr(error))
@@ -296,47 +312,147 @@ class Brain:
             if self.want == "on":
                 self._load()
 
-    def set_want(self, want: str):
+    def set_want(self, want: str, *, context_window: int | None = None):
         mode = _brain_mode(want)
         if mode is None:
             raise ValueError(f"Invalid brain mode: {want!r}")
         with self._operation():
             if mode != "off" and self._stop_event.is_set():
                 return
+            if context_window is not None:
+                self._preferred_context = context_window
             self.want = mode
             self._retry_at = 0.0
-            if mode == "off" or self.paused:
+            if mode == "off":
                 self._unload()
             elif mode == "on":
                 self._load()
 
     def auto_manage(self, heavy: bool, idle: float):
         with self._state:
+            if heavy and not self._heavy and self._preferred_context > BRAIN_CTX_LITE:
+                self._pending_context_unload = True
             self._heavy = heavy
-            if heavy and self.want == "auto":
-                self._pending_auto_unload = True
         with self._operation(wait=False) as acquired:
             if acquired and self.want == "auto":
                 idle = max(idle, time.monotonic() - self.last_used)
                 if idle >= BRAIN_IDLE_UNLOAD_S:
                     self._unload()
 
-    def chat(self, messages: list, max_tokens: int, temperature: float) -> str:
+    def _format_chat(self, messages: list, complete, **options):
+        """Use the model's active llama-cpp chat handler for the tokenized prompt."""
+        llm = self.llm
+        handler = (llm.chat_handler or llm._chat_handlers.get(llm.chat_format)
+                   or get_chat_completion_handler(llm.chat_format))
+
+        class ChatBackend:
+            def __getattr__(self, name):
+                return getattr(llm, name)
+
+            def create_completion(self, prompt, **kwargs):
+                if not isinstance(prompt, list) or kwargs.get("suffix") is not None:
+                    raise ValueError("Chat handler did not supply a tokenized prompt")
+                return complete(prompt, **kwargs)
+
+        return handler(llama=ChatBackend(), messages=_prepare_messages(messages, self.model_name), **options)
+
+    def _prompt_size(self, messages: list) -> int:
+        """Measure the handler's formatted prompt without running inference."""
+        class PromptMeasured(Exception):
+            pass
+
+        def measure(prompt, **kwargs):
+            raise PromptMeasured(len(prompt))
+
+        try:
+            self._format_chat(messages, measure)
+        except PromptMeasured as measured:
+            return measured.args[0]
+        raise ValueError("Chat handler did not format a completion prompt")
+
+    def _fit_prompt(self, messages: list, max_tokens: int) -> list:
+        """Fit the formatted prompt, dropping the oldest exchange first."""
+        context_window = self._loaded_context or self.context_window
+        budget = context_window - max_tokens
+        fitted = [message.copy() for message in messages]
+        size = self._prompt_size(fitted)
+        while size > budget and len(fitted) > 2:
+            del fitted[1:3]
+            size = self._prompt_size(fitted)
+        if size <= budget:
+            return fitted
+
+        def restore_prefix(message, original):
+            low, high = 0, len(original)
+            best = message["content"]
+            while low < high:
+                middle = (low + high + 1) // 2
+                candidate = original[:middle] + ("…" if middle < len(original) else "")
+                message["content"] = candidate
+                if self._prompt_size(fitted) <= budget:
+                    low, best = middle, candidate
+                else:
+                    high = middle - 1
+            message["content"] = best
+
+        request = fitted[-1]
+        original_request, request["content"] = request["content"], ""
+        if self._prompt_size(fitted) > budget:
+            system = fitted[0]
+            original_system, system["content"] = system["content"], ""
+            if self._prompt_size(fitted) > budget:
+                raise ValueError("Chat template leaves insufficient room for the reply")
+            if system is not request:
+                restore_prefix(system, original_system)
+        restore_prefix(request, original_request)
+        return fitted
+
+    def chat(self, messages: list, max_tokens: int, temperature: float, *,
+             expected_context: int | None = None) -> str:
         with self._operation():
+            if expected_context is not None and expected_context != self.context_window:
+                return ""
             self._load()
-            if self._stop_event.is_set() or self.paused or self.llm is None:
+            if (self._stop_event.is_set() or not self.available
+                    or self._loaded_context != self.context_window
+                    or (expected_context is not None and self._loaded_context != expected_context)):
                 return ""
             try:
-                result = self.llm.create_chat_completion(
-                    messages=_prepare_messages(messages, self.model_name),
-                    max_tokens=max_tokens, temperature=temperature, repeat_penalty=1.3, stop=["\n"])
+                messages = self._fit_prompt(messages, max_tokens)
+                def complete(prompt, **kwargs):
+                    if len(prompt) + max_tokens > self._loaded_context:
+                        raise ValueError("Formatted prompt exceeds reply headroom")
+                    return self.llm.create_completion(prompt, **kwargs)
+
+                result = self._format_chat(
+                    messages, complete,
+                    max_tokens=max_tokens, temperature=temperature,
+                    repeat_penalty=1.3, stop=["\n"])
                 return result["choices"][0]["message"]["content"] or ""
             finally:
                 self.last_used = time.monotonic()
 
 
 # 6. MISH (logic)
-OPEN_RE = re.compile(r"\[OPEN:\s*([^\]]+)\]", re.I)
+OPEN_RE = re.compile(r"\[OPEN:([^\[\]]*)\]", re.I)
+_OPEN_MARKER = re.compile(r"\[\s*open\s*:", re.I)
+_OPEN_NAME = re.compile(r"[\w][\w .+'#()-]{0,47}")
+_INVALID_OPEN_REPLY = "I couldn't use that app name."
+
+
+def _open_target(reply: str) -> str | None:
+    match = OPEN_RE.fullmatch(reply.strip())
+    if not match:
+        return None
+    raw = match.group(1)
+    if any(not char.isprintable() or char in "[];&|$`" for char in raw):
+        return None
+    app = raw.strip()
+    if len(app) >= 2 and app[0] == app[-1] and app[0] in "\"'":
+        app = app[1:-1].strip()
+    return app if "\"" not in app and "'" not in app and _OPEN_NAME.fullmatch(app) else None
+
+
 _PRODUCTIVE_DETAILS = frozenset({"code", "work"})
 
 
@@ -347,7 +463,8 @@ class Mish:
         self.store = Store(DATA_DIR / "memory.json")
         self.settings = Settings(DATA_DIR / "settings.json")
         self.stop_event = threading.Event()
-        self.brain = Brain(self.settings["brain_mode"], stop_event=self.stop_event)
+        context_window = BRAIN_CTX_LITE if self.settings["brain_context"] == "lite" else BRAIN_CTX
+        self.brain = Brain(self.settings["brain_mode"], stop_event=self.stop_event, context_window=context_window)
         self.hub = AutomationHub(self.store, self.ui)
         self.canned = self._load_canned()
         self.llm_lock = threading.Lock()
@@ -537,7 +654,7 @@ class Mish:
                 if top.get("text"):
                     vars_out["task"] = str(top["text"])
                 if top.get("due"):
-                    vars_out["due"] = fmt_due(top["due"]) if "fmt_due" in globals() else str(top["due"])
+                    vars_out["due"] = fmt_due(top["due"])
         except Exception:
             pass
         if extra:
@@ -868,50 +985,61 @@ class Mish:
                 pass
 
     # ---- prompts + generation -----------------------------------------------------
-    def context(self) -> str:
-        tasks = self.store.pending()[:3]
-        task_lines = "\n".join(
-            f"- #{i} {t['text']}" + (f" (due {fmt_due(t['due'])})" if t["due"] else "")
-            for i, t in enumerate(tasks, 1)) or "(no pending tasks)"
-        strong = [f for f, sc in self.store.facts_sorted() if sc >= FACT_PROMPT_MIN][:3]
-        facts = "\n".join(f"- {f}" for f in strong) or "(nothing yet)"
-        acts = "\n".join(f"- {a['t'][11:16]} {a['text'][:120]}" for a in self.store.data["activity"][-2:]) or "(nothing yet)"
-        s = self.store.today_stats()
-        top = max(s["apps"], key=s["apps"].get) if s["apps"] else None
-        phase, paused, left = self._timer_snapshot()
+    def context(self, query: str = "", *, context_window: int | None = None) -> str:
+        lite = (context_window or self.brain.context_window) <= BRAIN_CTX_LITE
+        budget = CONTEXT_CHARS_LITE if lite else CONTEXT_CHARS_MAIN
+        width = 56 if lite else 100
+
+        def short(value, limit):
+            text = " ".join(str(value).split())
+            return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+        with self._mood_lock:
+            profile, mood, annoyance = self.active_profile, self._mood_tier(), self.annoyance
+            app = self._live_friendly
+            phase, paused, left = self._timer_snapshot()
+        lines = [f"State: profile={profile} | mood={mood} ({annoyance}/100) | app={short(app, 42)}",
+                 f"Current time: {datetime.now():%a %H:%M}"]
         if paused > 0:
-            focus_line = f"Focus: PAUSED ({fmt_dur(paused)} left). "
-        elif phase == "break" and left > 0:
-            focus_line = f"Break: ON ({fmt_dur(left)} left). "
-        elif phase == "work" and left > 0:
-            focus_line = f"Focus: ON ({fmt_dur(left)} left). "
-        else:
-            focus_line = ""
-        return (
-            f"Current time: {datetime.now():%A %H:%M}\n"
-            f"Pending tasks:\n{task_lines}\n"
-            f"Known facts:\n{facts}\n"
-            f"Recently seen:\n{acts}\n"
-            f"Today: {fmt_dur(s['work'])} work, {fmt_dur(s['slack'])} slack"
-            + (f", most used app {top}" if top else "") + ". "
-            f"{focus_line}"
-        )
+            lines.append(f"Focus paused: {fmt_dur(paused)} left")
+        elif phase in ("work", "break") and left > 0:
+            label = "Focus" if phase == "work" else "Break"
+            lines.append(f"{label}: {fmt_dur(left)} left")
+
+        for task in self.store.relevant_tasks(query):
+            due = task_due(task)
+            suffix = f" (due {due:%a %H:%M})" if due else ""
+            lines.append(f"Task: {short(task['text'], width - len(suffix))}{suffix}")
+        for fact in self.store.relevant_facts(query):
+            lines.append(f"Fact: {short(fact['text'], width)}")
+
+        kept, size = [], 0
+        for line in lines:
+            extra = len(line) + bool(kept)
+            if size + extra > budget:
+                break
+            kept.append(line)
+            size += extra
+        return "\n".join(kept)
 
     def generate(self, event: str, window: str = "", user_text: str | None = None,
                  extra: str = "", bypass_cooldown: bool = False) -> str:
         """Only direct conversation and file requests can reach the local model."""
         if event not in ("chat", "file"):
             return self._ambient_line(event, window, extra, bypass_cooldown)
-        if self.strike_mode or self.brain.want == "off" or self.brain.paused:
+        if self.strike_mode or self.brain.want == "off":
             return ""
         chat = event == "chat"
         instruction = EVENT_INSTRUCTIONS[event]
 
-        parts = [PERSONA, RULES, f"CONTEXT (reference only, do NOT reply to it):\n{self.context()}"]
-        recent = self._recent_snapshot()
+        context_window = self.brain.context_window
+        lite = context_window <= BRAIN_CTX_LITE
+        grounded = self.context(query=user_text or "", context_window=context_window)
+        parts = [PERSONA, RULES, f"CONTEXT:\n{grounded}"]
+        recent = self._recent_snapshot()[-2:] if not lite else []
         if recent:
             parts.append("Lines you already said (do NOT repeat or reuse their wording):\n"
-                         + "\n".join(f"- {r}" for r in recent))
+                         + "\n".join(f"- {r[:60]}" for r in recent))
         if chat:
             with self._mood_lock:
                 hint = PROFILES[self.active_profile]["persona"]
@@ -920,7 +1048,12 @@ class Mish:
 
         messages = [{"role": "system", "content": system}]
         if chat:
-            messages += self.store.data["chat_history"][-6:]
+            with self.store.lock:
+                history = self.store.data["chat_history"][-6:]
+            for user, assistant in zip(history, history[1:]):
+                if user["role"] == "user" and assistant["role"] == "assistant":
+                    messages.extend({"role": entry["role"], "content": entry["content"][:144]}
+                                    for entry in (user, assistant))
             messages.append({"role": "user", "content": user_text or ""})
         else:
             job = instruction.format(extra=extra)
@@ -932,11 +1065,14 @@ class Mish:
                     self._last_prompt = "\n".join(f"[{m['role']}]\n{m['content']}" for m in messages)
                     t0 = time.time()
                     max_tok = 72 if chat else 32
-                    raw = self.brain.chat(messages, max_tok, 0.75)
+                    raw = self.brain.chat(messages, max_tok, 0.75, expected_context=context_window)
                     if not raw:
                         return ""
                     self._last_gen_ms = int((time.time() - t0) * 1000)
                     log(f"generated in {self._last_gen_ms / 1000:.1f}s ({self.brain.model_name})")
+                if chat and _OPEN_MARKER.search(raw):
+                    app = _open_target(raw)
+                    return f"[OPEN: {app}]" if app else _INVALID_OPEN_REPLY
                 text = clean_reply(raw)
                 if text and META_RE.search(text):             # he started describing himself: retry once
                     log("dropped self-describing line:", text[:80])
@@ -1162,11 +1298,50 @@ class Mish:
             return self.facts_text()
         if low in ("stats", "today"):
             return self.stats_text()
-        for handler in (self._cmd_facts, self._cmd_focus, self._cmd_look, self._cmd_tasks):
+        for handler in (self._cmd_hub, self._cmd_facts, self._cmd_focus, self._cmd_look, self._cmd_tasks):
             reply = handler(text, low)
             if reply is not None:
                 return reply
         return None
+
+    _HUB_QUERIES = {
+        "calendar": frozenset({"what's on my calendar", "what is on my calendar", "my schedule",
+                               "upcoming events", "what's on my schedule", "show my calendar"}),
+        "blackboard": frozenset({"check blackboard", "blackboard deadlines", "what's due on blackboard"}),
+        "deadlines": frozenset({"any deadlines", "what's due", "what is due", "my deadlines", "upcoming deadlines"}),
+        "sync": frozenset({"sync everything", "sync all", "refresh calendar", "sync tasks", "sync my calendar"}),
+    }
+
+    def _cmd_hub(self, text: str, low: str) -> str | None:
+        phrase = " ".join(low.replace("’", "'").rstrip("?.!").split()).removeprefix("please ")
+        kind = next((key for key, phrases in self._HUB_QUERIES.items() if phrase in phrases), None)
+        if kind is None:
+            return None
+        if kind == "sync":
+            return self._bang_sync("")
+
+        now = datetime.now()
+        entries = []
+        for task in self.store.pending_snapshot():
+            due = task_due(task)
+            if due is None:
+                continue
+            source = task_source(task)
+            if kind == "calendar" and (source not in ("Google Calendar", "Outlook") or due < now):
+                continue
+            if kind == "blackboard" and source != "Blackboard":
+                continue
+            title = task["text"]
+            if source and title.startswith("[") and "]" in title:
+                title = title.split("]", 1)[1].lstrip()
+            label = f"[{source}] " if source else ""
+            entries.append(f"- {label}{title} — {fmt_due(due.isoformat())}")
+            if len(entries) == 5:
+                break
+
+        title = {"calendar": "Upcoming synced events", "blackboard": "Blackboard deadlines",
+                 "deadlines": "Pending deadlines"}[kind]
+        return title + ":\n" + "\n".join(entries) if entries else f"No {title.lower()}."
 
     def _cmd_facts(self, text: str, low: str) -> str | None:
         m = re.match(r"remember(?:\s+that)?\s+(.+)", text, re.I)
@@ -1194,9 +1369,6 @@ class Mish:
             return self.start_focus(int(m.group(1) or FOCUS_DEFAULT_MIN), int(m.group(2) or BREAK_DEFAULT_MIN))
         m = re.fullmatch(r"(?:start\s+)?focus(?:\s+(\d{1,3}))?", low)
         return self.start_focus(int(m.group(1) or FOCUS_DEFAULT_MIN)) if m else None
-        m = re.fullmatch(r"(?:start\s+)?focus(?:\s+(\d{1,3}))?", low)
-        if m:
-            return self.start_focus(int(m.group(1) or FOCUS_DEFAULT_MIN))
 
     def _cmd_look(self, text: str, low: str) -> str | None:
         m = re.fullmatch(r"(?:observe|watch|glance)\s+(on|off)", low)
@@ -1347,7 +1519,7 @@ class Mish:
             "ver": self._bang_ver, "version": self._bang_ver,
             "profile": self._bang_profile, "clip2task": self._bang_clip2task,
             "focus": self._bang_focus,
-            "sync": lambda _r: (self.hub.sync_now_async(announce_empty=True), "Syncing Blackboard, Google & Microsoft...")[1],
+            "sync": self._bang_sync,
             "bb": self._bang_bb,
             "msid": self._bang_msid,
             "connect": self._bang_connect,
@@ -1384,6 +1556,10 @@ class Mish:
     def _bang_ver(self, _arg: str) -> str:
         with self._mood_lock:
             return f"Mish v{__version__} (profile: {self.active_profile})"
+
+    def _bang_sync(self, _arg: str) -> str:
+        self.hub.sync_now_async(announce_empty=True)
+        return "Syncing Blackboard, Google & Microsoft..."
 
     def _bang_bb(self, arg: str) -> str:
         if not arg:
@@ -1450,21 +1626,26 @@ class Mish:
         return f"Added task from clipboard: {first_line}"
 
     def _bang_brain(self, arg: str) -> str:
-        if not arg:
+        choice = arg.strip().lower()
+        if not choice:
             return self.brain.status_text()
-        mode = _brain_mode(arg)
-        if mode is None:
-            return "Usage: !brain [on|off|auto]"
+        if choice not in ("on", "off", "auto", "main", "lite"):
+            return "Usage: !brain [on|off|auto|main|lite]"
         with self._inference_slot(wait=True) as acquired:
             if not acquired:
                 return ""
             with self.busy():
                 if self.stop_event.is_set():
                     return ""
-                self.brain.set_want(mode)
+                if choice in ("main", "lite"):
+                    size = BRAIN_CTX_LITE if choice == "lite" else BRAIN_CTX
+                    self.brain.set_want(self.brain.want, context_window=size)
+                else:
+                    self.brain.set_want(choice)
             if self.stop_event.is_set():
                 return ""
-            self.settings.update(brain_mode=mode)
+            key = "brain_context" if choice in ("main", "lite") else "brain_mode"
+            self.settings.update(**{key: choice})
             return self.brain.status_text()
 
     def _bang_heavy(self, rest: str) -> str:
@@ -1670,15 +1851,6 @@ class Mish:
         with self._mood_lock:
             return PROFILES[self.active_profile]["categories"].get(detail, "neutral")
 
-    def _classify_both(self, title: str, app: str) -> tuple[str, str]:
-        """Return the active profile's category and the unmodified foreground detail."""
-        detail = classify_detail(title, app)
-        return self._profile_category(detail), detail
-
-    def classify_with_profile(self, title: str, app: str) -> str:
-        """Backward compatible: 'work' | 'slack' | 'neutral'."""
-        return self._classify_both(title, app)[0]
-
     def shutdown(self):
         """Stop admission, drain memory writes, and unload GGUF weights."""
         with self._inference:
@@ -1731,7 +1903,11 @@ class Mish:
             return
 
         if self.strike_mode:
-            self.say(self._canned("strike_chat"), expr="strike")
+            hub_reply = self._cmd_hub(text, text.strip().lower())
+            if hub_reply is not None:
+                self.say(hub_reply)
+            else:
+                self.say(self._canned("strike_chat"), expr="strike")
             return
         reply = self.handle_command(text)
         if reply is not None:
@@ -1748,8 +1924,7 @@ class Mish:
                 self.say("Brain is off. Use !brain auto or !brain on.", expr="sad")
                 return
             summary = self._generate_owned("chat", user_text=f"Briefly summarize or explain what I copied:\n{clip}")
-            self.say(summary or ("Brain is paused under heavy load." if self.brain.paused
-                                 else "Couldn't summarize that clipboard text."), expr="neutral")
+            self.say(summary or "Couldn't summarize that clipboard text.", expr="neutral")
             return
 
         if self.brain.want == "off":
@@ -1757,15 +1932,17 @@ class Mish:
             return
         reply = self._generate_owned("chat", user_text=text)
         if not reply:
-            self.say("Brain is paused under heavy load." if self.brain.paused
-                     else "Brain unavailable. Check for a .gguf in models/ and see Mish.log.", expr="sad")
+            self.say("Brain unavailable. Check for a .gguf in models/ and see Mish.log.", expr="sad")
             return
 
-        m = OPEN_RE.search(reply)                            # the model itself decided to open an app
-        if m:
-            app = m.group(1).strip()
-            ok = self.launch(app, trusted=False)             # only aliases and known apps, never arbitrary programs
-            reply = f"Opening {app}." if ok else f"I don't know where {app} lives. Teach me with !alias {app} <path>"
+        if _OPEN_MARKER.search(reply):
+            app = _open_target(reply)
+            if app is None:
+                reply = _INVALID_OPEN_REPLY
+            elif self.launch(app, trusted=False):
+                reply = f"Opening {app}."
+            else:
+                reply = f"I don't know where {app} lives. Teach me with !alias {app} <path>"
         self.store.add_history("user", text)
         self.store.add_history("assistant", reply)
         self.say(reply)
@@ -2385,6 +2562,8 @@ class Settings:
         """A safe value, or None if invalid (a bad settings file must never break startup)."""
         if key == "brain_mode":
             return _brain_mode(v)
+        if key == "brain_context":
+            return v if v in ("main", "lite") else None
         if key == "dev":
             return 1 if v in (1, True, "1") else 0
         if key == "theme":
@@ -2425,6 +2604,10 @@ class Settings:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             if "brain_mode" not in raw:
                 raw["brain_mode"] = raw.get("brain", raw.get("brain_override"))
+            if "brain_context" not in raw:
+                legacy = raw["brain_mode"]
+                if isinstance(legacy, str) and legacy.strip().lower() in ("main", "lite"):
+                    raw["brain_context"] = legacy.strip().lower()
             for k in self.DEFAULTS:
                 v = self._clean(k, raw.get(k))
                 if v is not None:
@@ -2458,7 +2641,7 @@ class Settings:
 
     def reset(self):
         defaults = self.fresh()
-        for key in ("dev", "brain_mode", "profile", "profile_auto"):
+        for key in ("dev", "brain_mode", "brain_context", "profile", "profile_auto"):
             defaults.pop(key)
         self.data.update(defaults)
         self.save()
