@@ -41,7 +41,8 @@ REACTION_COOLDOWN = 45           # seconds between window-switch reactions
 
 AMBIENT_MIN_GAP = 90             # minimum seconds between any unsolicited popups
 BRAIN_IDLE_UNLOAD_S = 15 * 60    # unload main brain to RAM after 15m idle
-__version__ = "0.5.21-beta"
+__version__ = "0.5.41 (beta)"
+DEFAULT_SETTINGS = {"dev": 0}        # 1 = Dev Console auto-opens and fast timers are on
 HOTKEY_MOD = 0x0001 | 0x4000     # MOD_ALT | MOD_NOREPEAT
 HOTKEY_VK = 0x4D                 # 'M' -> Alt+M global summon
 
@@ -89,8 +90,26 @@ HEAVY_ENTER_S = 8                # heavy load must last this long before he shri
 HEAVY_EXIT_S = 25                # and it must be calm this long before he grows back
 SWAP_MIN_GAP = 45                # never swap more often than this
 HW_POLL_S = 3
-DEFAULT_HEAVY = ["fallout4.exe", "ltspice.exe"]            # edit with !heavy add / remove
+DEFAULT_HEAVY = ["", ""]            # edit with !heavy add / remove
 AMBIENT_EVENTS = {"observe", "reminder", "slacking", "switch", "pester", "wake"}   # muted in heavy mode
+ANNOYANCE_START = 15
+MOOD_IRRITATED_AT = 40           # tier "irritated" from here
+MOOD_FED_UP_AT = 80              # tier "fed_up" from here
+ANNOY_SLACK_STEP = 8             # +annoyance per bump while slacking/gaming outside focus
+ANNOY_FOCUS_STEP = 15            # +annoyance per bump while slacking during focus mode
+ANNOY_NAG_STEP = 12              # +annoyance each time a due-task nag fires
+ANNOY_DONE_REWARD = 25           # -annoyance when a task is completed
+SLACK_STREAK_S = 90              # continuous seconds on a slack category before it starts annoying him
+FOCUS_SLACK_STREAK_S = 15        # same, but during focus mode
+SLACK_BUMP_GAP = 45              # min seconds between two slack bumps
+SCOLD_LLM_GAP = 120              # at fed_up: at most one LLM-written scolding per this many seconds
+CANNED_FIRST_EVENTS = {"switch", "slacking", "gaming", "nag", "pester"}   # rendered from templates, no LLM
+DEV_SLACK_STREAK_S = 5
+DEV_FOCUS_SLACK_STREAK_S = 3
+DEV_SLACK_BUMP_GAP = 5
+DEV_REACTION_COOLDOWN = 5
+DEV_AMBIENT_MIN_GAP = 5
+DEV_WINDOW_SWITCH_CHANCE = 1.0
 QUIET_EVENTS = {"poke"}          # generated without showing the "thinking" eyes
 
 
@@ -182,6 +201,8 @@ EVENT_INSTRUCTIONS = {
     "focus_punish": "The user is in focus mode but opened '{window}'. You just teleported to the middle of their "
                     "screen to stop them. Demand that they close it.",
     "focus_done": "The user just finished their {extra}. Congratulate them briefly with a tiny bit of sass.",
+    "gaming": "The user has been playing or sitting in '{window}' for a while instead of working. "
+              "Scold them, smug and clingy, and mention their pending work.",
 }
 
 
@@ -192,7 +213,7 @@ EVENT_HINTS = {     # fallback face if his words don't match a keyword rule
     "slacking": "smug", "reminder": "smug", "switch": "curious", "pester": "smug", "nag": "squint",
     "startup": "happy", "wake": "surprised", "poke": "surprised", "strike_start": "angry",
     "strike_end": "squint", "strike_chat": "strike", "file": "squint", "heavy_end": "smug",
-    "focus_punish": "angry",
+    "focus_punish": "angry", "gaming": "smug",
 }
 
 
@@ -207,4 +228,4 @@ HELP_TEXT = """Commands:
   !sys | !time | !clean | !brain | !heavy"""
 
 
-BANG_HELP = "Commands: !sync, !bb, !connect, !mail, !msid, !open, !apps, !alias, !read, !sys, !time, !clean, !brain, !heavy, !profile, !focus, !clip2task, !ver"
+BANG_HELP = "Commands: !sync, !bb, !connect, !mail, !msid, !open, !apps, !alias, !read, !sys, !time, !clean, !brain, !heavy, !profile, !focus, !clip2task, !ver, !dev"

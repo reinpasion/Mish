@@ -187,14 +187,114 @@ def is_fullscreen_foreground() -> bool:
     return False
 
 
-def classify(title: str, app: str) -> str:
-    blob = f"{title} {app}".lower()
-    if any(k in blob for k in SLACK_KEYWORDS):
-        return "slack"
+# ---- granular classification (v0.5.30) -------------------------------------------
+def _compile_tokens(tokens):
+    """Tokens are matched at a word start. A trailing '*' means prefix match ("steam*" hits steamwebhelper.exe);
+    without it the token must also end on a word boundary ("git" must not match "digital")."""
+    parts = []
+    for t in tokens:
+        prefix = t.endswith("*")
+        t = t.rstrip("*")
+        p = re.escape(t)
+        if t[0].isalnum():
+            p = r"(?<![a-z0-9])" + p
+        if not prefix and t[-1].isalnum():
+            p += r"(?![a-z0-9])"
+        parts.append(p)
+    return re.compile("|".join(parts))
+
+
+_DETAIL_RULES = (
+    ("game", _compile_tokens((
+        "steam*", "epicgames*", "epic games*", "riot*", "valorant*", "league of legends*", "leagueclient*",
+        "roblox*", "minecraft*", "genshin*", "fallout*", "cyberpunk*", "overwatch*", "eldenring*", "elden ring*",
+        "fortnite*", "battle.net", "dota", "cs2", "-win64-shipping.exe", "-win32-shipping.exe"))),
+    ("media", _compile_tokens(("youtube*", "spotify*", "netflix*", "twitch*", "vlc", "mpv"))),
+    ("social", _compile_tokens(("discord*", "reddit*", "messenger*", "instagram*", "tiktok*", "facebook*",
+                                "x.com", "twitter*"))),
+    ("code", _compile_tokens(("code.exe", "visual studio code", "pycharm*", "devenv*", "windowsterminal*",
+                              "powershell*", "pwsh", "cmd.exe", "git", "github*"))),
+)
+
+
+def classify_detail(title: str, app: str) -> str:
+    """'game' | 'media' | 'social' | 'code' | 'work' | 'neutral'.
+    The exe name is checked first, so 'steam-api.py - Visual Studio Code' is code, not a game."""
+    app_l = (app or "").lower()
+    blob = f"{title or ''} {app_l}".lower()
+    for text in (app_l, blob):
+        if not text.strip():
+            continue
+        for label, rx in _DETAIL_RULES:
+            if rx.search(text):
+                return label
+    if any(k in blob for k in SLACK_KEYWORDS):        # legacy lists keep old behaviour (anime, 9gag, vortex...)
+        return "media"
     if any(k in blob for k in WORK_KEYWORDS):
         return "work"
     return "neutral"
 
+
+def detail_to_cat(detail: str) -> str:
+    """Backward-compatible 3-way category used by stats and focus punishment."""
+    if detail in ("game", "media", "social"):
+        return "slack"
+    if detail in ("code", "work"):
+        return "work"
+    return "neutral"
+
+
+def classify(title: str, app: str) -> str:
+    return detail_to_cat(classify_detail(title, app))
+
+
+# ---- friendly names --------------------------------------------------------------------
+_BROWSER_EXES = {"chrome", "msedge", "firefox", "zen", "brave", "opera", "opera_gx", "vivaldi", "arc", "chromium"}
+_BROWSER_NAMES = r"(?:Google Chrome|Microsoft\W{0,3}Edge|Mozilla Firefox|Zen Browser|Brave|Opera(?: GX)?|Vivaldi|Arc|Chromium)"
+_BROWSER_SUFFIX = re.compile(rf"^(?P<page>.*)\s+[-\u2013\u2014]\s+{_BROWSER_NAMES}\s*$", re.I)
+_SITES = (("youtube", "YouTube"), ("twitch", "Twitch"), ("netflix", "Netflix"), ("reddit", "Reddit"),
+          ("instagram", "Instagram"), ("tiktok", "TikTok"), ("facebook", "Facebook"), ("twitter", "Twitter"),
+          ("x.com", "X"), ("github", "GitHub"), ("stack overflow", "Stack Overflow"), ("spotify", "Spotify"),
+          ("gmail", "Gmail"), ("discord", "Discord"), ("messenger", "Messenger"))
+_APP_NAMES = {
+    "code": "VS Code", "devenv": "Visual Studio", "windowsterminal": "Windows Terminal", "powershell": "PowerShell",
+    "pwsh": "PowerShell", "cmd": "Command Prompt", "discord": "Discord", "spotify": "Spotify", "steam": "Steam",
+    "steamwebhelper": "Steam", "epicgameslauncher": "Epic Games", "explorer": "File Explorer", "winword": "Word",
+    "excel": "Excel", "powerpnt": "PowerPoint", "notepad": "Notepad", "pycharm64": "PyCharm", "vlc": "VLC",
+    "mpv": "mpv", "eldenring": "Elden Ring", "cs2": "CS2", "leagueclient": "League of Legends",
+    "riotclientservices": "Riot Client", "applicationframehost": "",
+}
+_SHIPPING_RE = re.compile(r"[-_ ]?(?:win64|win32)[-_ ]?shipping$|[-_](?:x64|x86)$", re.I)
+
+
+def _cap(s: str, n: int = 32) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "\u2026"
+
+
+def friendly_app_name(title: str, app: str) -> str:
+    """'YouTube - Google Chrome' -> 'YouTube', 'Valorant-Win64-Shipping.exe' -> 'Valorant', 'Code.exe' -> 'VS Code'."""
+    title = (title or "").strip()
+    base = (app or "").lower().removesuffix(".exe")
+    base = _SHIPPING_RE.sub("", base)
+
+    m = _BROWSER_SUFFIX.match(title)
+    if base in _BROWSER_EXES or m:
+        content = (m.group("page") if m else title).strip()
+        low = content.lower()
+        for key, pretty in _SITES:
+            if key in low:
+                return pretty
+        segs = [s for s in re.split(r"\s+[-\u2013\u2014|]\s+", content) if s]
+        if len(segs) > 1 and len(segs[-1]) <= 28:         # "Page title - SiteName"
+            return _cap(segs[-1])
+        return _cap(segs[0]) if segs else (base.title() or "your browser")
+
+    if base in _APP_NAMES and _APP_NAMES[base]:
+        return _APP_NAMES[base]
+    if base and base not in _APP_NAMES:
+        return _cap(base.replace("_", " ").replace("-", " ").title())
+    return _cap(title) or "that window"
 
 # ---- keyboard automation (used by the !open errand) ------------------------------------
 def _key_event(vk: int, up: bool = False):
@@ -365,6 +465,7 @@ class Store:
         self.lock = threading.RLock()
         self._dirty = False
         self.data = self._load()
+        self.on_complete = None
         self.save()
 
     @staticmethod
@@ -450,6 +551,12 @@ class Store:
         with self.lock:
             task["done"], task["done_at"] = True, now_iso()
             self.save()
+        cb = self.on_complete                     
+        if cb:
+            try:
+                cb(task)
+            except Exception as e:
+                log("on_complete failed:", repr(e))
 
     def delete(self, task: dict):
         with self.lock:

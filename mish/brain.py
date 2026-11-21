@@ -81,6 +81,16 @@ from .config import (
     VISION_MODEL,
     WINDOW_SWITCH_CHANCE,
     ENABLE_LLM,
+    ANNOY_DONE_REWARD, ANNOY_FOCUS_STEP, ANNOY_NAG_STEP, ANNOY_SLACK_STEP, ANNOYANCE_START,
+    CANNED_FIRST_EVENTS, FOCUS_SLACK_STREAK_S, MOOD_FED_UP_AT, MOOD_IRRITATED_AT, SCOLD_LLM_GAP,
+    SLACK_BUMP_GAP, SLACK_STREAK_S,
+    DEFAULT_SETTINGS,
+    DEV_AMBIENT_MIN_GAP,
+    DEV_FOCUS_SLACK_STREAK_S,
+    DEV_REACTION_COOLDOWN,
+    DEV_SLACK_BUMP_GAP,
+    DEV_SLACK_STREAK_S,
+    DEV_WINDOW_SWITCH_CHANCE,
     __version__,
 )
 from .win_utils import (
@@ -101,6 +111,9 @@ from .win_utils import (
     launch_app,
     log,
     parse_when,
+    classify_detail,
+    detail_to_cat,
+    friendly_app_name,
 )
 from .integrations import (
     AutomationHub
@@ -302,8 +315,10 @@ class Mish:
         self.canned = self._load_canned()
         self.llm_lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.recent = deque(maxlen=5)               # his last lines, so he doesn't repeat himself
-
+        self.recent = deque(maxlen=5)
+        self._canned_recent: deque[str] = deque(maxlen=80)   # long-margin dedup for canned/generated lines
+        self._canned_lock = threading.Lock()                  # guards only snapshot + append, never held while rendering
+        self._slot_warned: set = set()                        # unresolved [slot] names already logged
         self.focus_until = 0.0
         self.focus_paused_rem = 0.0          # remaining seconds when paused
         self.focus_phase = "off"             # off | work | break
@@ -324,6 +339,19 @@ class Mish:
         self._busy = 0                              # any work he is doing (used for the CPU check)
         self._busy_visible = 0                      # ...of which the user should see as "thinking" eyes
         self._busy_lock = threading.Lock()
+        self.annoyance: int = ANNOYANCE_START      # 0..100
+        self.current_cat: str = "neutral"          # detail category (game/media/social/code/work/neutral)
+        self.cat_streak_s: float = 0.0             # continuous seconds on current_cat
+        self._last_annoyance_decay: float = time.time()
+        self._last_slack_bump = 0.0
+        self._last_scold = 0.0
+        self._mood_lock = threading.RLock()
+        self.store.on_complete = lambda _t: self._bump_annoyance(-ANNOY_DONE_REWARD)
+        self.dev_mode: bool = bool(self.settings.get("dev", 0))
+        self._dev_fast_timers: bool = self.dev_mode
+        self._last_prompt: str = "(none yet)"
+        self._last_gen_ms: int = 0
+        self._live_friendly: str = "(none yet)"     # last window name seen by watcher_loop
         self._scrub_history()
 
     def _load_canned(self) -> dict:
@@ -338,13 +366,325 @@ class Mish:
                     log("canned lines failed to load:", repr(e))
         return {}
 
-    def _canned(self, event: str) -> str:
-        lines = self.canned.get(event) or []
+    _PLACEHOLDER_RE = re.compile(r"\{(app|task|due|mins|tier)\}")
+
+    def _mood_tier(self) -> str:
+        a = self.annoyance
+        if a >= MOOD_FED_UP_AT:
+            return "fed_up"
+        return "irritated" if a >= MOOD_IRRITATED_AT else "chill"
+
+    def _bump_annoyance(self, delta: int) -> int:
+        with self._mood_lock:
+            self.annoyance = int(clamp(self.annoyance + delta, 0, 100))
+            return self.annoyance
+
+    # ---- phrase / grammar expander (v0.5.32) ----
+    _SLOT_RE = re.compile(r"\[([a-zA-Z0-9_]+)\]")
+    _SLOT_MAX_DEPTH = 6                  # nesting levels of [slot] inside [slot]
+    _CANNED_TRIES = 20                   # rejection-sampling draws per call
+
+    def _warn_slot(self, name: str, why: str):
+        if name not in self._slot_warned:
+            self._slot_warned.add(name)
+            log(f"canned: slot [{name}] {why}; left as typed")
+
+    def _slot_lines(self, name: str, tier: str) -> list:
+        """Options for [name]: the tier variant first (irritated / fed_up only), then the plain slot.
+        Empty-string options are kept on purpose, so a slot can be optional filler."""
+        keys = [f"{name}__{tier}"] if tier in ("irritated", "fed_up") else []
+        keys.append(name)
+        for key in keys:
+            opts = self.canned.get(key)
+            if isinstance(opts, str):
+                opts = [opts]
+            if isinstance(opts, list):
+                opts = [o for o in opts if isinstance(o, str)]
+                if opts:
+                    return opts
+        return []
+
+    def _expand_slots(self, text: str, tier: str, depth: int = 0, seen: frozenset = frozenset()) -> str:
+        """Recursively replace [slot] tags. Missing/empty slots, cycles (name already on the active path)
+        and anything deeper than _SLOT_MAX_DEPTH are left as typed. Never raises."""
+        if depth >= self._SLOT_MAX_DEPTH or "[" not in text:
+            return text
+
+        def repl(m):
+            name = m.group(1)
+            if name in seen:
+                self._warn_slot(name, "is circular")
+                return m.group(0)
+            options = self._slot_lines(name, tier)
+            if not options:
+                self._warn_slot(name, "is missing or empty")
+                return m.group(0)
+            return self._expand_slots(random.choice(options), tier, depth + 1, seen | {name})
+        return self._SLOT_RE.sub(repl, text)
+
+    def _canned_vars(self, extra: dict | None = None) -> dict:
+        """Safe template values for {app}, {task}, {due}, {mins}, and {tier}."""
+        vars_out = {
+            "app": self._live_friendly if getattr(self, "_live_friendly", "(none yet)") != "(none yet)" else "that app",
+            "task": "your task",
+            "due": "soon",
+            "mins": str(max(1, int(round(self.cat_streak_s / 60.0)))),
+            "tier": self._mood_tier().replace("_", " "),
+        }
+        try:
+            pending = self.store.pending()
+            if pending:
+                top = pending[0]
+                if top.get("text"):
+                    vars_out["task"] = str(top["text"])
+                if top.get("due"):
+                    vars_out["due"] = fmt_due(top["due"]) if "fmt_due" in globals() else str(top["due"])
+        except Exception:
+            pass
+        if extra:
+            for k, v in extra.items():
+                if v is not None and str(v) != "":
+                    vars_out[k] = str(v)
+        return vars_out
+
+    def _canned(self, event: str, **vars) -> str:
+        """A template line for `event`, with no LLM and no llm_lock.
+        Bucket: "{event}__{tier}" first, then "{event}". Each draw: pick a line, expand [slots], substitute
+        {app} {task} {due} {mins} {tier}, tidy spaces. Up to 20 draws are tried; the first one not among the
+        last 80 outputs wins. If every draw collides, the one used longest ago is returned."""
+        tier = self._mood_tier()
+        lines = self.canned.get(f"{event}__{tier}") or self.canned.get(event) or []
+        if isinstance(lines, str):
+            lines = [lines]
+        if not isinstance(lines, list):
+            return ""
+        lines = [l for l in lines if isinstance(l, str) and l.strip()]
         if not lines:
             return ""
-        line = random.choice([l for l in lines if l not in self.recent] or lines)
+
+        live: dict = {}                              # {app}/{task}/... are computed once, and only if needed
+
+        def render(template: str) -> str:
+            text = self._expand_slots(template, tier)
+            slotted = text != template
+            if "{" in text:
+                if not live:
+                    live.update(self._canned_vars({"tier": tier, **vars}))
+                text = self._PLACEHOLDER_RE.sub(lambda m: live.get(m.group(1), m.group(0)), text)
+            text = re.sub(r"\s{2,}", " ", text).strip()
+            if slotted and text and text[0].islower():        # a slot join left it lowercase
+                text = text[0].upper() + text[1:]
+            return text
+
+        with self._canned_lock:
+            history = list(self._canned_recent)
+        used = set(history)
+        last_seen = {l: i for i, l in enumerate(history)}      # later index overwrites: last occurrence
+
+        chosen, collided = None, []
+        for _ in range(self._CANNED_TRIES):
+            cand = render(random.choice(lines))
+            if not cand:
+                continue
+            if cand not in used:
+                chosen = cand
+                break
+            collided.append(cand)
+        if chosen is None:
+            if not collided:
+                return ""
+            chosen = min(collided, key=lambda c: last_seen.get(c, -1))   # oldest last use
+
+        with self._canned_lock:
+            self._canned_recent.append(chosen)
+        self.recent.append(chosen)                             # LLM prompt context keeps its short window
+        return chosen
+
+    def _canned(self, event: str, **vars) -> str:
+        """A template line for `event` with {app} {task} {due} {mins} {tier} filled in."""
+        lines = self.canned.get(f"{event}__{self._mood_tier()}") or self.canned.get(event) or []
+        if not isinstance(lines, list):
+            return ""
+        lines = [l for l in lines if isinstance(l, str)]
+        if not lines:
+            return ""
+        v = self._canned_vars(vars) if any("{" in l for l in lines) else None
+        rendered = [self._PLACEHOLDER_RE.sub(lambda m: v.get(m.group(1), m.group(0)), l) for l in lines] if v else lines
+        with self._canned_lock:
+            recent = set(self._canned_recent)
+        line = random.choice([r for r in rendered if r not in recent] or rendered)
+        with self._canned_lock:
+            self._canned_recent.append(line)
         self.recent.append(line)
         return line
+
+
+    def _ambient_line(self, event: str, window: str = "", extra: str = "") -> str:
+        """Blocking helper for loops (scheduler): templates normally, LLM only for a fed_up scolding."""
+        if event in CANNED_FIRST_EVENTS and not self._llm_scold_ok():
+            return self.generate(event, window, extra=extra, canned_only=True)
+        with self.llm_lock:
+            return self.generate(event, window, extra=extra)
+
+    # ---- mood updates (called from the watcher thread) ----
+    def _track_streak(self, detail: str, dt: float):
+        with self._mood_lock:
+            if detail == self.current_cat:
+                self.cat_streak_s += dt
+            else:
+                self.current_cat, self.cat_streak_s = detail, 0.0
+
+    def _mood_decay(self, now: float, cat: str, detail: str):
+        """-1 per calm minute, -2 per minute of continuous work/code. No decay while slacking."""
+        with self._mood_lock:
+            elapsed = now - self._last_annoyance_decay
+            if elapsed < 60:
+                return
+            periods = int(elapsed // 60)
+            self._last_annoyance_decay += periods * 60
+            if cat == "slack":
+                return
+            per = 2 if (detail in ("work", "code") and self.current_cat == detail and self.cat_streak_s >= 60) else 1
+            self.annoyance = int(clamp(self.annoyance - per * periods, 0, 100))
+
+    def _slack_streak_need(self, focus: bool) -> float:
+        if self._dev_fast_timers:
+            return DEV_FOCUS_SLACK_STREAK_S if focus else DEV_SLACK_STREAK_S
+        return FOCUS_SLACK_STREAK_S if focus else SLACK_STREAK_S
+
+    def _slack_bump_gap(self) -> float:
+        return DEV_SLACK_BUMP_GAP if self._dev_fast_timers else SLACK_BUMP_GAP
+
+    def _reaction_cooldown(self) -> float:
+        return DEV_REACTION_COOLDOWN if self._dev_fast_timers else REACTION_COOLDOWN
+
+    def _ambient_min_gap(self) -> float:
+        return DEV_AMBIENT_MIN_GAP if self._dev_fast_timers else AMBIENT_MIN_GAP
+
+    def _switch_chance(self) -> float:
+        return DEV_WINDOW_SWITCH_CHANCE if self._dev_fast_timers else WINDOW_SWITCH_CHANCE
+
+    def _llm_scold_ok(self, ignore_gap: bool = False) -> bool:
+        """At fed_up he may use the LLM for ONE scolding line, but only if the brain is already awake.
+        Never loads or wakes a model for an ambient reaction. ignore_gap is for forced dev triggers."""
+        return (self.annoyance >= MOOD_FED_UP_AT and self.brain.available and not self.brain.asleep
+                and not self.heavy_mode and not self._idle_unloaded
+                and (ignore_gap or time.time() - self._last_scold >= SCOLD_LLM_GAP))
+
+    def _slack_bump(self, now: float, focus: bool) -> bool:
+        need, gap = self._slack_streak_need(focus), self._slack_bump_gap()
+        with self._mood_lock:
+            if self.cat_streak_s < need or now - self._last_slack_bump < gap:
+                return False
+            self._last_slack_bump = now
+            step = ANNOY_FOCUS_STEP if focus else ANNOY_SLACK_STEP
+            self.annoyance = int(clamp(self.annoyance + step, 0, 100))
+            return True
+
+    # ---- dev console commands (regex only, no eval) ----
+    _DEV_CALL_RE = re.compile(r"^\s*([a-z_]+)\s*(?:\(\s*(.*?)\s*\))?\s*$", re.I)
+    _DEV_CMDS = {"fedup", "irritated", "chill", "annoy", "fire", "timers", "toggle_timers",
+                 "prompt", "state", "help"}
+    _DEV_DEFAULTS = {"fedup": 85, "irritated": 45, "chill": 15}
+    _DEV_EVENTS = ("gaming", "slacking", "nag", "switch", "pester", "focus_punish")
+    _DEV_FIRE_APPS = {"gaming": "Valorant", "slacking": "YouTube", "switch": "Discord",
+                      "focus_punish": "YouTube"}
+    DEV_HELP = ("fedup(n=85) irritated(n=45) chill(n=15) annoy(n)\n"
+                "fire(gaming|slacking|nag|switch|pester|focus_punish[, app])\n"
+                "timers(fast|normal) | toggle_timers() | prompt() | state() | help()\n"
+                "!dev [on|off|<command>]")
+
+    def is_dev_cmd(self, text: str) -> bool:
+        m = self._DEV_CALL_RE.match(text or "")
+        return bool(m and m.group(1).lower() in self._DEV_CMDS)
+
+    def _set_annoyance(self, n) -> int:
+        with self._mood_lock:
+            self.annoyance = int(clamp(int(n), 0, 100))
+            return self.annoyance
+
+    def _timers_text(self) -> str:
+        if self._dev_fast_timers:
+            return f"Timers: FAST ({DEV_SLACK_STREAK_S}s streak, {DEV_REACTION_COOLDOWN}s cooldown)"
+        return f"Timers: NORMAL ({SLACK_STREAK_S}s streak, {REACTION_COOLDOWN}s cooldown)"
+
+    def dev_status_text(self) -> str:
+        """Five-line live readout. Read-only, so the Tk thread may call it directly."""
+        now, b = time.time(), self.brain
+        return (f"Time: {time.strftime('%H:%M:%S', time.localtime(now))} ({int(now)})\n"
+                f"Annoyance: {self.annoyance}/100 ({self._mood_tier().replace('_', ' ')})\n"
+                f"Window: {self._live_friendly} [{self.current_cat} \u00b7 {int(self.cat_streak_s)}s]\n"
+                f"Brain: {b.profile or b.want}/{b.model_name or 'none'} | heavy={self.heavy_mode}\n"
+                f"{self._timers_text()}")
+
+    def _dev_fire(self, args: list) -> str:
+        event = args[0].lower() if args else ""
+        if event not in self._DEV_EVENTS:
+            return "Usage: fire(gaming|slacking|nag|switch|pester|focus_punish[, app])"
+        window = args[1] if len(args) > 1 else self._DEV_FIRE_APPS.get(event, "")
+        if self.strike_mode:
+            return "Blocked: strike mode is on (only strike lines are allowed)."
+        if event in AMBIENT_EVENTS and self.heavy_mode:
+            return "Blocked: heavy mode mutes ambient events. Try !brain main or wait for it to clear."
+        if event in AMBIENT_EVENTS and is_fullscreen_foreground():
+            return "Blocked: a fullscreen window is in the foreground."
+        if event == "focus_punish":
+            self.ui.put(("focus_punish", window or "YouTube"))     # UI teleports him, then react_async runs
+            return f"Fired focus_punish for '{window or 'YouTube'}'."
+        extra = ""
+        if event == "nag":
+            pending = self.store.pending()
+            extra = pending[0]["text"] if pending else ""
+        self.react_async(event, window, force=True, extra=extra, bypass_cooldown=True)
+        return f"Fired {event} (annoyance {self.annoyance}, {self._mood_tier().replace('_', ' ')})."
+
+    def run_dev_cmd(self, raw: str) -> str:
+        """fedup/irritated/chill/annoy/fire/timers/toggle_timers/prompt/state/help. Pure regex dispatch."""
+        m = self._DEV_CALL_RE.match(raw or "")
+        if not m or m.group(1).lower() not in self._DEV_CMDS:
+            return "Unknown dev command. Try help()"
+        name = m.group(1).lower()
+        args = [a.strip().strip("\"'") for a in (m.group(2) or "").split(",") if a.strip()]
+        if name in ("fedup", "irritated", "chill", "annoy"):
+            if args:
+                try:
+                    n = int(args[0])
+                except ValueError:
+                    return f"{name}() needs a whole number, e.g. {name}(60)"
+            elif name == "annoy":
+                return "Usage: annoy(n)"
+            else:
+                n = self._DEV_DEFAULTS[name]
+            n = self._set_annoyance(n)
+            return f"Annoyance = {n} ({self._mood_tier().replace('_', ' ')})"
+        if name == "fire":
+            return self._dev_fire(args)
+        if name in ("timers", "toggle_timers"):
+            if args:
+                a = args[0].lower()
+                if a not in ("fast", "normal"):
+                    return "Usage: timers(fast|normal)"
+                self._dev_fast_timers = a == "fast"
+            else:
+                self._dev_fast_timers = not self._dev_fast_timers
+            return self._timers_text()
+        if name == "prompt":
+            return f"[{self._last_gen_ms}ms]\n{self._last_prompt}"
+        if name == "state":
+            return self.dev_status_text()
+        return self.DEV_HELP
+
+    def _bang_dev(self, arg: str) -> str:
+        a = arg.strip()
+        low = a.lower()
+        if low in ("", "on", "off"):
+            on = (not self.dev_mode) if not low else low == "on"
+            self.dev_mode = on
+            self._dev_fast_timers = on
+            self.settings.update(dev=1 if on else 0)
+            self.ui.put(("dev_panel", on))                         # UI opens / closes the console
+            return "Dev mode ON: fast timers, console open." if on else "Dev mode OFF: normal timers."
+        return self.run_dev_cmd(a)
 
     def _scrub_history(self):
         """Old saved replies with "Mish:" labels or self-descriptions would teach him to repeat them."""
@@ -420,21 +760,77 @@ class Mish:
         )
 
     def generate(self, event: str, window: str = "", user_text: str | None = None,
-                 seen: str = "", extra: str = "") -> str:
-        """One in-character line for `event`. Returns "" when he has nothing to say (muted, no brain, error)."""
+                 seen: str = "", extra: str = "", canned_only: bool = False,
+                 bypass_cooldown: bool = False) -> str:
+        """One in-character line for `event`. Returns "" when he has nothing to say (muted, no brain, error).
+        canned_only=True never touches the LLM. bypass_cooldown=True ignores the ambient min gap (dev triggers)."""
         chat = event == "chat"
         if self.strike_mode and event not in STRIKE_EVENTS:
             return ""
         if event in AMBIENT_EVENTS:
             if self.heavy_mode or is_fullscreen_foreground():
                 return ""
-            if time.time() - self._last_ambient_say < AMBIENT_MIN_GAP:
+            if not bypass_cooldown and time.time() - self._last_ambient_say < self._ambient_min_gap():
                 return ""
-        if not chat and not self.brain.available:            # no brain: canned lines, if there is a file for them
-            return self._canned(event)
+        if not chat and (canned_only or not self.brain.available):    # templates: no model needed
+            vars: dict = {}
+            if window:
+                vars["app"] = window
+            if event == "nag" and extra:
+                vars["task"] = extra
+            line = self._canned(event, **vars)
+            self._last_prompt = f"(template, no LLM) event={event} tier={self._mood_tier()}\n{line}"
+            self._last_gen_ms = 0
+            if line and event in AMBIENT_EVENTS:
+                self._last_ambient_say = time.time()
+            return line
         instruction = EVENT_INSTRUCTIONS.get(event)
         if instruction is None:
             return ""
+
+        parts = [PERSONA, RULES, f"CONTEXT (reference only, do NOT reply to it):\n{self.context()}"]
+        if self.recent:
+            parts.append("Lines you already said (do NOT repeat or reuse their wording):\n"
+                         + "\n".join(f"- {r}" for r in self.recent))
+        if chat:
+            parts.append(OPEN_RULE)
+        system = "\n\n".join(parts)
+
+        messages = [{"role": "system", "content": system}]
+        if chat:
+            messages += self.store.data["chat_history"][-6:]
+            messages.append({"role": "user", "content": user_text or ""})
+        else:
+            job = instruction.format(window=window or "unknown", seen=seen, extra=extra)
+            messages.append({"role": "user", "content": f"Your job right now: {job}\n\nReply in one line, max 25 words."})
+
+        try:
+            for _ in range(2):
+                with self.busy(visible=event not in QUIET_EVENTS):
+                    self._last_prompt = "\n".join(f"[{m['role']}]\n{m['content']}" for m in messages)
+                    t0 = time.time()
+                    max_tok = 72 if chat else 32
+                    raw = self.brain.chat(messages, max_tok, 0.75)
+                    self._last_gen_ms = int((time.time() - t0) * 1000)
+                    log(f"generated in {self._last_gen_ms / 1000:.1f}s ({self.brain.model_name})")
+                text = clean_reply(raw)
+                if text and META_RE.search(text):             # he started describing himself: retry once
+                    log("dropped self-describing line:", text[:80])
+                    messages[0] = {"role": "system", "content": system +
+                                   "\nIMPORTANT: Do not talk about yourself, your personality or your name. Just say the line."}
+                    continue
+                if text:
+                    text = text if len(text) <= 250 else text[:247] + "..."
+                    self.recent.append(text)
+                    if event in AMBIENT_EVENTS:
+                        self._last_ambient_say = time.time()
+                    if event in CANNED_FIRST_EVENTS:
+                        self._last_scold = time.time()        # rate-limits LLM scolding at fed_up
+                    return text
+                break
+        except Exception as e:
+            log("generate failed:", repr(e))
+        return ""
 
         parts = [PERSONA, RULES, f"CONTEXT (reference only, do NOT reply to it):\n{self.context()}"]
         if self.recent:
@@ -470,22 +866,32 @@ class Mish:
                     self.recent.append(text)
                     if event in AMBIENT_EVENTS:
                         self._last_ambient_say = time.time()
+                    if event in CANNED_FIRST_EVENTS:
+                        self._last_scold = time.time()        # rate-limits LLM scolding at fed_up
                     return text
                 break
         except Exception as e:
             log("generate failed:", repr(e))
         return ""
 
-    def react_async(self, event: str, window: str = "", force: bool = False, extra: str = ""):
+    def react_async(self, event: str, window: str = "", force: bool = False, extra: str = "",
+                    bypass_cooldown: bool = False):
         """Say something in character about `event` without blocking the UI.
-        force=True waits for the brain instead of skipping when it is busy."""
+        Template-first events never take llm_lock or wake the brain, except for one LLM scolding line at fed_up
+        when the brain is already loaded. force=True waits for the brain instead of skipping when it is busy.
+        bypass_cooldown=True is for forced dev triggers (ignores the ambient gap and the scold gap)."""
         def work():
             if self.strike_mode and event not in STRIKE_EVENTS:
+                return
+            if event in CANNED_FIRST_EVENTS and not self._llm_scold_ok(ignore_gap=bypass_cooldown):
+                self.say(self.generate(event, window, extra=extra, canned_only=True,
+                                       bypass_cooldown=bypass_cooldown), expr=EVENT_HINTS.get(event))
                 return
             if not self.llm_lock.acquire(blocking=force):
                 return
             try:
-                self.say(self.generate(event, window, extra=extra), expr=EVENT_HINTS.get(event))
+                self.say(self.generate(event, window, extra=extra, bypass_cooldown=bypass_cooldown),
+                         expr=EVENT_HINTS.get(event))
             finally:
                 self.llm_lock.release()
         threading.Thread(target=work, daemon=True).start()
@@ -690,8 +1096,11 @@ class Mish:
         m = re.fullmatch(r"(?:pomo|pomodoro)(?:\s+(\d{1,3})(?:\s+(\d{1,2}))?)?", low)
         if m:
             return self.start_focus(int(m.group(1) or FOCUS_DEFAULT_MIN), int(m.group(2) or BREAK_DEFAULT_MIN))
-        m = re.fullmatch(r"focus(?:\s+(\d{1,3}))?", low)
+        m = re.fullmatch(r"(?:start\s+)?focus(?:\s+(\d{1,3}))?", low)
         return self.start_focus(int(m.group(1) or FOCUS_DEFAULT_MIN)) if m else None
+        m = re.fullmatch(r"(?:start\s+)?focus(?:\s+(\d{1,3}))?", low)
+        if m:
+            return self.start_focus(int(m.group(1) or FOCUS_DEFAULT_MIN))
 
     def _cmd_look(self, text: str, low: str) -> str | None:
         m = re.fullmatch(r"(?:observe|watch|glance)\s+(on|off)", low)
@@ -890,6 +1299,7 @@ class Mish:
             "msid": self._bang_msid,
             "connect": self._bang_connect,
             "mail": self._bang_mail,
+            "dev": self._bang_dev,
         }
         handler = handlers.get(cmd)
         return handler(rest) if handler else "Unknown command. " + BANG_HELP
@@ -1039,43 +1449,109 @@ class Mish:
         self.settings.update(apps=apps)
         return f"Saved. !open {name} will launch it."
 
-    def _bang_open(self, rest: str) -> str:
+    _LAUNCH_RE = re.compile(r"^(?:please\s+)?(?:open|launch|start|run)\s+(.+)$", re.I)
+    _LAUNCH_TAIL_RE = re.compile(r"(?:\s+(?:for me|please|pls|app|application|program))+$", re.I)
+    _LAUNCH_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .+#&'\-]{0,38}$")     # no paths, no quotes
+    _LAUNCH_BAD_FIRST = frozenset(
+        "a an up out over off down away again now me you us him her them it this that these those there here "
+        "my your our his their its some any another one more new back on in at for with about into from by as "
+        "like just only also soon later tomorrow today tonight focus pomo pomodoro timer stopwatch break "
+        "countdown working thinking typing talking being getting going doing trying looking fresh slow fast".split())
+    _LAUNCH_BAD_ANY = frozenset("and then or but so if because while when which".split())
+    _APP_SYNONYMS = {
+        "vs code": "vscode", "visual studio code": "vscode", "calculator": "calc", "task manager": "taskmgr",
+        "file explorer": "explorer", "google chrome": "chrome", "ms paint": "paint", "microsoft paint": "paint",
+        "epic games": "epic", "epic games launcher": "epic",
+    }
+
+    def _parse_launch_request(self, text: str) -> str | None:
+        """The app name from a clear one-line "open/launch/start/run <app>" request, else None.
+        Questions, multi-sentence text, paths and phrases like "start a timer" or "open up to me" are left to chat."""
+        t = (text or "").strip()
+        if not t or len(t) > 60 or "?" in t or "\n" in t:
+            return None
+        m = self._LAUNCH_RE.match(t)
+        if not m:
+            return None
+        body = m.group(1).strip().rstrip(".!").strip()
+        if re.search(r"[!;,]|\.\s", body):                                   # more than one sentence / clause
+            return None
+        body = self._LAUNCH_TAIL_RE.sub("", body).strip()
+        body = re.sub(r"^the\s+", "", body, flags=re.I)
+        words = body.lower().split()
+        if not words or len(words) > 3:
+            return None
+        if words[0] in self._LAUNCH_BAD_FIRST or any(w in self._LAUNCH_BAD_ANY for w in words):
+            return None
+        return body if self._LAUNCH_TARGET_RE.fullmatch(body) else None
+
+    def _bang_open(self, rest: str, via_chat: bool = False) -> str:
+        """!open <app>. A lone app name is launched directly if it resolves (aliases, defaults, known installs,
+        and for typed commands PATH/paths too). Otherwise a Start-menu search errand is queued, whether or not
+        a brain is loaded. via_chat=True (plain-text requests) never launches arbitrary paths or PATH programs."""
         if not rest:
             return "Usage: !open <app>  (see !apps)"
         try:
             tokens = [t.strip('"') for t in shlex.split(rest, posix=False)]
         except ValueError:
             return "I couldn't parse that. Check your quotes."
-        target = tokens[0]
+        if not tokens or not tokens[0]:
+            return "Usage: !open <app>  (see !apps)"
+        shown = tokens[0]
 
-        # A plain app name with a brain loaded: he runs the errand (dives off, searches Start, springs back).
-        # With arguments, or no brain, launch directly so nothing is lost.
-        if len(tokens) == 1 and self.brain.available and not self.brain.asleep:
+        if len(tokens) == 1:
+            target = self._APP_SYNONYMS.get(shown.lower(), shown)
+            if self.launch(target, trusted=not via_chat):
+                return self._canned("open_app", app=shown) or f"Opening {shown}."
             if self._errand_busy and time.time() - self._errand_t < 20:
                 return "Still busy with the last app. One errand at a time."
             self._errand_busy, self._errand_t = True, time.time()
-            self.ui.put(("errand_start", target))
+            self.ui.put(("errand_start", target))                  # works with the brain off, asleep or in heavy mode
             return ""                                              # the window plays it and reports the result
 
-        if self.launch(target, tokens[1:]):
-            return f"Opening {target}."
-        return f"I couldn't open {target}. Use !alias {target} <path> to teach me where it is."
+        if self.launch(shown, tokens[1:]):
+            return f"Opening {shown}."
+        return f"I couldn't open {shown}. Use !alias {shown} <path> to teach me where it is."
+
+    _SEARCH_HOSTS = frozenset({"searchhost.exe", "searchapp.exe", "startmenuexperiencehost.exe",
+                               "shellexperiencehost.exe"})
+
+    def _search_focused(self) -> bool:
+        """True while the foreground window is Windows Search / Start (Win11 SearchHost, Win10 SearchApp)."""
+        title, app = get_active_window_info()
+        return app in self._SEARCH_HOSTS or title.strip().lower() in ("search", "start")
 
     def do_os_search(self, app_name: str):
-        """Press Win, type the app name and press Enter so Windows search opens the best match.
-        Reports back with ("errand_done", ok) so the window can bring him home."""
+        """Win key -> wait until Search really has focus -> type the name -> Enter.
+        Aborts without typing if Search never gets focus or loses it, so keystrokes never land in another app.
+        Always clears _errand_busy and reports ("errand_done", ok) so the window brings him home."""
         def work():
-            ok = True
+            ok = False
             try:
                 time.sleep(0.15)
                 _tap_key(0x5B)                                      # Win: opens Start / search
-                time.sleep(0.6)
+                deadline, focused = time.time() + 2.0, False
+                while time.time() < deadline:
+                    time.sleep(0.1)
+                    if self._search_focused():
+                        focused = True
+                        break
+                if not focused:
+                    log("search errand: Search never took focus, aborting:", app_name)
+                    return
+                time.sleep(0.25)                                    # let the search box accept input
+                if not self._search_focused():
+                    log("search errand: focus lost before typing, aborting:", app_name)
+                    return
                 _type_text(app_name)
                 time.sleep(0.7)                                     # let the results appear
+                if not self._search_focused():
+                    log("search errand: focus lost before Enter, aborting:", app_name)
+                    return
                 _tap_key(0x0D)                                      # Enter: open the top result
                 time.sleep(0.8)                                     # let the app start before he comes back
+                ok = True
             except Exception as e:
-                ok = False
                 log("search failed:", repr(e))
             finally:
                 self._errand_busy = False
@@ -1133,19 +1609,23 @@ class Mish:
         finally:
             user32.CloseClipboard()
 
-    def classify_with_profile(self, title: str, app: str) -> str:
-        """Classify foreground window using both base rules and the user's active focus profile."""
-        prof_name = self.settings.data.get("profile", "general")
-        prof = FOCUS_PROFILES.get(prof_name, FOCUS_PROFILES["general"])
+    def _classify_both(self, title: str, app: str) -> tuple[str, str]:
+        """(category, detail): category is work/slack/neutral (stats, focus), detail is game/media/social/code/work/neutral."""
+        prof = FOCUS_PROFILES.get(self.settings.data.get("profile", "general"), FOCUS_PROFILES["general"])
         hay = f"{app} {title}".lower()
         if any(k in hay for k in prof.get("work_extra", [])):
-            return "work"
+            return "work", "work"
         if any(k in hay for k in prof.get("slacking_extra", [])):
-            return "slack"
-        cat = classify(title, app)
+            return "slack", "media"
+        detail = classify_detail(title, app)
+        cat = detail_to_cat(detail)
         if cat == "slack" and not prof.get("nag_slacking", True):
-            return "neutral"
-        return cat
+            return "neutral", "neutral"
+        return cat, detail
+
+    def classify_with_profile(self, title: str, app: str) -> str:
+        """Backward compatible: 'work' | 'slack' | 'neutral'."""
+        return self._classify_both(title, app)[0]
 
     def shutdown(self):
         """Gracefully stop background loops, flush memory, and unload GGUF weights."""
@@ -1187,6 +1667,14 @@ class Mish:
         if reply is not None:
             self.say(reply)
             return
+
+        target = self._parse_launch_request(text)            # "open spotify": no brain, no llm_lock
+        if target:
+            out = self._bang_open(f'"{target}"' if " " in target else target, via_chat=True)
+            if out:
+                self.say(out)
+            return
+
         low = text.strip().lower()
         if any(p in low for p in ("summarize clipboard", "explain clipboard", "what did i copy", "read clipboard")):
             clip = self.get_clipboard_text(1200)
@@ -1210,7 +1698,7 @@ class Mish:
             self.say("Brain offline - check Mish.log.", expr="sad")
             return
 
-        m = OPEN_RE.search(reply)                            # he decided to open an app
+        m = OPEN_RE.search(reply)                            # the model itself decided to open an app
         if m:
             app = m.group(1).strip()
             ok = self.launch(app, trusted=False)             # only aliases and known apps, never arbitrary programs
@@ -1268,9 +1756,9 @@ class Mish:
             try:
                 self.store.run_daily_decay()
                 for task in self.store.due_for_nag(datetime.now()):
-                    with self.llm_lock:
-                        line = self.generate("nag", extra=task["text"])
-                    self.say(line or f"Task due: {task['text']}", expr="squint")   # plain status if the brain is down
+                    self._bump_annoyance(ANNOY_NAG_STEP)               # ignored nags make him crankier
+                    line = self._ambient_line("nag", extra=task["text"])
+                    self.say(line or f"Task due: {task['text']}", expr="squint")   # plain status if nothing to say
                     self.store.mark_nagged(task)
                 self._nag_memory_pressure()
             except Exception as e:
@@ -1285,32 +1773,50 @@ class Mish:
             self.say(self._canned("heavy_load"), expr="angry")
 
     def watcher_loop(self):
-        last_title, last_react, last_flush = "", 0.0, time.time()
+        last_title, last_react, last_flush, last_tick = "", 0.0, time.time(), time.time()
         while not self.stop_event.wait(1.5):
             try:
                 now = time.time()
-                if idle_seconds() >= IDLE_PAUSE and not self.in_focus():
+                dt = clamp(now - last_tick, 0.0, 5.0)
+                last_tick = now
+                focus = self.in_focus()
+                if idle_seconds() >= IDLE_PAUSE and not focus:
+                    self._mood_decay(now, "neutral", "neutral")      # away from the keyboard counts as calm
                     continue
                 title, app = get_active_window_info()
-                cat = self.classify_with_profile(title, app)
+                if self.dev_mode and title == "Mish Dev Console":
+                    continue
+                if not (title or app):
+                    self._live_friendly = "(empty title/app)"
+                    continue
+                cat, detail = self._classify_both(title, app)
+                friendly = friendly_app_name(title, app) or title or app or "(unnamed)"
+                self._live_friendly = friendly
                 self.store.record_usage(app or title[:30], cat, 1.5)
+                self._track_streak(detail, dt)
+                self._mood_decay(now, cat, detail)
 
-                if self.in_focus() and cat == "slack":
-                    if now - last_react >= 15:
+                if focus and cat == "slack":
+                    if now - last_react >= min(15, self._reaction_cooldown()):
                         last_react = now
                         self.ui.put(("focus_punish", title))
+                        self._slack_bump(now, focus=True)
                 elif title != last_title:
                     last_title = title
-                    if now - last_react >= REACTION_COOLDOWN and random.random() < WINDOW_SWITCH_CHANCE:
+                    if now - last_react >= self._reaction_cooldown() and random.random() < self._switch_chance():
                         last_react = now
-                        self.react_async("slacking" if cat == "slack" else "switch", title)
+                        event = "gaming" if detail == "game" else "slacking" if cat == "slack" else "switch"
+                        self.react_async(event, friendly)
+                if cat == "slack" and not focus and self._slack_bump(now, focus=False):
+                    if now - last_react >= self._reaction_cooldown():   # a long streak earns a callout, {mins} is live
+                        last_react = now
+                        self.react_async("gaming" if detail == "game" else "slacking", friendly)
                 if now - last_flush > 60:
                     last_flush = now
                     if self.store._dirty:
                         self.store.save()
             except Exception as e:
                 log("watcher_loop error:", repr(e))
-
 
 # 7. EXPRESSION ENGINE (eyes) + SETTINGS
 C_CYAN, C_AMBER, C_RED, C_ORANGE = "#00e6ff", "#ffd166", "#ff3355", "#ff6600"
@@ -1401,6 +1907,9 @@ EXPRESSIONS = {
     "asleep":    dict(top=5.5, bot=5.5, color=C_SLEEP, wander=0.0, look=0.0, blink=0.0),
     "scared":    dict(ring=1.0, color=C_ORANGE, jitter=True, wander=0.0, look=0.0, emote="!"),
     "dizzy":     dict(ring=1.0, color=C_RED, orbit=True, wander=0.0, look=0.0),
+    "calm":      dict(top=0.4, bot=0.2, color=C_CYAN, wander=1.0, look=0.8, blink=0.85),
+    "irritated": dict(top=2.0, bot=0.8, slant=1.4, gx=1.0, color="#f97316", wander=0.15, look=0.5, blink=0.6),
+    "fed_up":    dict(top=2.4, bot=1.2, slant=2.6, color="#f43f5e", wander=0.05, look=0.9, blink=0.35, emote="!"),
 }
 
 
@@ -1426,8 +1935,9 @@ STATE_RGB = {                                     # state-driven eye colours (id
     "happy": (16, 185, 129), "laugh": (16, 185, 129),
     "scared": (244, 63, 94), "angry": (244, 63, 94), "dizzy": (244, 63, 94),
     "sleepy": (99, 102, 241),
+    "irritated": (249, 115, 22),                  # mood: orange
+    "fed_up": (244, 63, 94),                      # mood: red
 }
-
 
 # What he says picks his face. First matching rule wins.
 _RULES = [(name, re.compile(pat, re.I)) for name, pat in (
@@ -1494,8 +2004,8 @@ class EyeEngine:
         self.emote, self.emote_until = None, 0.0
         self.orbit = 0.0
         self.last_ptr, self.last_ptr_move = None, 0.0
-        self.inertia = (0.0, 0.0)
-
+        self.inertia = (0.0, 0.0),
+        self._mood = "chill"
     # ---- controls ----------------------------------------------------------------
     def configure(self, color=None, mood=None, shape=None):
         if color:
@@ -1521,6 +2031,25 @@ class EyeEngine:
         return _rgb_hex(self.color)
 
     # ---- state ---------------------------------------------------------------------
+    _MOOD_HYST = 4                                   # points of annoyance below a threshold before he relaxes
+
+    def _update_mood(self, a):
+        """Tier with hysteresis, so annoyance hovering at 40 or 80 can't make the face flicker."""
+        if a is None:
+            return
+        m, h = self._mood, self._MOOD_HYST
+        if a >= MOOD_FED_UP_AT:
+            m = "fed_up"
+        elif m == "fed_up" and a >= MOOD_FED_UP_AT - h:
+            m = "fed_up"
+        elif a >= MOOD_IRRITATED_AT:
+            m = "irritated"
+        elif m in ("irritated", "fed_up") and a >= MOOD_IRRITATED_AT - h:
+            m = "irritated"
+        else:
+            m = "chill"
+        self._mood = m
+
     def _resolve(self, now: float, c: dict) -> str:
         """Which face applies right now. Real states beat temporary expressions, which beat idle moods."""
         for flag, face in (("strike", "strike"), ("sleeping", "asleep"), ("scared", "scared"), ("dizzy", "dizzy"),
@@ -1534,7 +2063,9 @@ class EyeEngine:
             return "sleepy"
         if idle_t > BORED_AFTER:
             return "bored"
-        return "focus" if c.get("focus") else "idle"
+        if self._mood != "chill":                    # "irritated" / "fed_up" are also expression names
+            return self._mood
+        return "focus" if c.get("focus") else "calm"
 
     def _on_change(self, new: str, now: float):
         self.blink_now(now, 0.24)
@@ -1544,7 +2075,8 @@ class EyeEngine:
         self.emote, self.emote_until = em, (now + 1.8 if em else 0.0)
 
     def _goal_color(self, name: str):
-        """Idle/neutral = the user's accent. Mood states use STATE_RGB. 'thinking' pulses amber <-> violet."""
+        """Idle/neutral = the user's accent. Mood states use STATE_RGB. 'thinking' pulses amber <-> violet.
+        'calm' is the accent with a faint emerald tint. With mood tints off, every state keeps the accent."""
         base = self.base_rgb
         ex_col = EXPRESSIONS[name]["color"]
         if name == "strike":
@@ -1556,6 +2088,8 @@ class EyeEngine:
         if name == "thinking":
             u = 0.5 + 0.5 * math.sin(time.time() * 2.4)
             return _mix(STATE_RGB["thinking"], STATE_RGB["curious"], 0.65 * u)
+        if name == "calm":
+            return _mix(base, STATE_RGB["happy"], 0.15)
         if name in STATE_RGB:
             return STATE_RGB[name]
         if ex_col == C_DIM:
@@ -1570,8 +2104,9 @@ class EyeEngine:
         self.last_t = now
         self.inertia = c.get("inertia", (0.0, 0.0))
 
+        self._update_mood(c.get("annoyance"))
         name = self._resolve(now, c)
-        if name == "idle" and now >= self.next_flourish:           # a random little expression now and then
+        if name in ("idle", "calm") and now >= self.next_flourish:   # a random little expression now and then
             self.next_flourish = now + random.uniform(25, 70)
             self.set_expression(random.choice(self.FLOURISH), random.uniform(1.3, 2.2))
             name = self._resolve(now, c)
@@ -1747,7 +2282,7 @@ EXE_RE = re.compile(r"[a-z0-9._ -]{1,40}")
 
 class Settings:
     DEFAULTS = dict(eye="#ffffff", bg="#08080a", shape="pill", mood=True, opacity=0.95, apps=None, heavy=None,
-                    profile="general", theme="auto")
+                    profile="general", theme="auto", **DEFAULT_SETTINGS)
 
     @classmethod
     def fresh(cls) -> dict:
@@ -1763,9 +2298,11 @@ class Settings:
 
     @staticmethod
     def _clean(key, v):
+        """A safe value, or None if invalid (a bad settings file must never break startup)."""
+        if key == "dev":
+            return 1 if v in (1, True, "1") else 0
         if key == "theme":
             return v if v in ("auto", "dark", "light") else None
-        """A safe value, or None if invalid (a bad settings file must never break startup)."""
         if key in ("eye", "bg"):
             ok = isinstance(v, str) and HEX_RE.match(v) and v.lower() != "#000001"   # #000001 = window chroma key
             return v.lower() if ok else None
@@ -1819,13 +2356,18 @@ class Settings:
     def __getitem__(self, key):
         return self.data[key]
 
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def reset(self):
+        dev = self.data.get("dev", 0)                  # Studio "Reset" is appearance-only; keep dev mode
+        self.data = self.fresh()
+        self.data["dev"] = dev
+        self.save()
+
     def update(self, **kw):
         for k, v in kw.items():
             c = self._clean(k, v)
             if c is not None:
                 self.data[k] = c
-        self.save()
-
-    def reset(self):
-        self.data = self.fresh()
         self.save()

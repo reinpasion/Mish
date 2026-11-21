@@ -306,8 +306,9 @@ class GhostMenu(tk.Toplevel):
                 w.bind("<Leave>", lambda e, r=refresh: self.after(1, r))
                 w.bind("<Button-1>", lambda e, cbk=cb: self._pick(cbk))
         self.update_idletasks()
-        w = max(inner.winfo_reqwidth() + 18, 232)
-        h = inner.winfo_reqheight() + 18
+        pad = 2 * shell._inset + 12                # was a hard-coded 18 (inset 3)
+        w = max(inner.winfo_reqwidth() + pad, 232)
+        h = inner.winfo_reqheight() + pad
         l, t, r, b = bounds or (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
         x = int(clamp(x, l + 4, max(l + 4, r - w - 4)))
         y = int(clamp(y, t + 4, max(t + 4, b - h - 4)))
@@ -396,6 +397,40 @@ def _aa(w: int, h: int):
 def _down(img, w: int, h: int):
     return img.resize((w, h), Image.Resampling.LANCZOS)
 
+def _bg_rgb(widget):
+    """Widget background as an (r, g, b) tuple, whatever form Tk reports it in."""
+    try:
+        v = str(widget.cget("bg"))
+        if len(v) == 7 and v.startswith("#"):
+            return _hex_rgb(v)
+        r, g, b = widget.winfo_rgb(v)
+        return (r >> 8, g >> 8, b >> 8)
+    except Exception:
+        return (0, 0, 0)
+
+
+def _flatten(img, rgb, snap: int = 0):
+    """Composite an RGBA image onto a solid colour -> opaque RGB. Edges blend with the real background, so there is
+    no fringe. snap > 0 forces pixels with alpha below it to exactly `rgb` (used for -transparentcolor keys)."""
+    a = img.getchannel("A")
+    if snap:
+        a = a.point(lambda v: 0 if v < snap else v)
+    base = Image.new("RGB", img.size, rgb)
+    base.paste(img.convert("RGB"), mask=a)
+    return base
+
+
+def render_card(w: int, h: int, radius: int, fill: str, line: str):
+    """Rounded rectangle with a crisp 1px hairline. The outline is drawn inside the box, so after an exact 4:1 BOX
+    downsample it covers exactly one pixel row/column (LANCZOS would ring and soften it)."""
+    img, d, S = _aa(w, h)
+    d.rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=radius * S, fill=fill, outline=line, width=S)
+    return img.resize((w, h), Image.Resampling.BOX)
+
+def render_shell(w: int, h: int, radius: int, fill: str, line: str, key_rgb):
+    """Shell art for a -transparentcolor window: opaque RGB over the key colour. Pixels that are mostly outside the
+    curve (alpha < 110) become exactly the key colour, so Windows cuts them out and no off-key halo is left."""
+    return _flatten(render_card(w, h, radius, fill, line), key_rgb, snap=110)
 
 def _soft_shadow(size, box, blur, alpha, clip=None):
     """Black blurred ellipse -> RGBA layer (optionally clipped by an L mask)."""
@@ -407,14 +442,6 @@ def _soft_shadow(size, box, blur, alpha, clip=None):
     lay = Image.new("RGBA", size, (0, 0, 0, 255))
     lay.putalpha(m)
     return lay
-
-
-def render_card(w: int, h: int, radius: int, fill: str, line: str):
-    """Rounded rectangle with a crisp 1px hairline (used for the 14px shell and the 10px inner cards)."""
-    img, d, S = _aa(w, h)
-    d.rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=radius * S, fill=fill, outline=line, width=S)
-    return _down(img, w, h)
-
 
 def render_pill_button(w: int, h: int, text: str, c: dict, kind: str = "secondary", state: str = "normal",
                        px: float = 9):
@@ -497,7 +524,8 @@ def render_slider(w: int, h: int, frac: float, c: dict, hover: bool = False, pre
 
 
 class _PilCanvas(tk.Canvas):
-    """Canvas that shows one PIL image through a single reusable PhotoImage and cleans up after itself."""
+    """Canvas that shows one PIL image through a single reusable PhotoImage and cleans up after itself.
+    The image is flattened onto the canvas background (opaque RGB), so corners are smooth on any theme."""
 
     def __init__(self, parent, w: int, h: int, bg: str, **kw):
         super().__init__(parent, width=w, height=h, bg=bg, highlightthickness=0, bd=0, **kw)
@@ -507,16 +535,25 @@ class _PilCanvas(tk.Canvas):
         self._after = None
         self._alive = True
 
+    def configure(self, cnf=None, **kw):
+        out = super().configure(cnf, **kw)
+        if (kw.keys() & {"bg", "background"}) and getattr(self, "_alive", False) \
+                and getattr(self, "_photo", None) is not None:
+            self._draw()                                             # the art is baked onto the old colour
+        return out
+    config = configure
+
     def _show(self, img):
         try:
-            if self._photo is None or (self._photo.width(), self._photo.height()) != img.size:
-                self._photo = ImageTk.PhotoImage(img, master=self)
+            flat = _flatten(img, _bg_rgb(self))
+            if self._photo is None or (self._photo.width(), self._photo.height()) != flat.size:
+                self._photo = ImageTk.PhotoImage(flat, master=self)
                 if self._item is None:
                     self._item = self.create_image(0, 0, image=self._photo, anchor="nw")
                 else:
                     self.itemconfigure(self._item, image=self._photo)
             else:
-                self._photo.paste(img)                               # in place: no new image per frame
+                self._photo.paste(flat)                              # in place: no new image per frame
         except tk.TclError:
             pass
 
@@ -533,7 +570,6 @@ class _PilCanvas(tk.Canvas):
             super().destroy()
         except tk.TclError:
             pass
-
 
 class PillButton(_PilCanvas):
     """Anti-aliased pill button. kind: 'secondary' | 'primary' | 'danger'. Hover and press states."""
@@ -745,28 +781,46 @@ class RoundSlider(_PilCanvas):
 
 
 class RoundedCard(tk.Canvas):
-    """10px inner card: put widgets in `.body`. Height follows the content; width follows the parent."""
+    """10px inner card: put widgets in `.body`. Height follows the content (see sync()); width follows the parent.
+    The card art is flattened onto the canvas background, so corners blend cleanly in Dark and Light."""
 
     def __init__(self, parent, theme: dict | None = None, radius: int = 10, pad: int = 10, bg: str | None = None,
                  fill: str | None = None, line: str | None = None):
         self._theme = theme or get_theme("auto")
         self._fill, self._line = fill, line                           # optional overrides (input wells)
-        self._r, self._pad, self._size = radius, pad, (0, 0)
+        self._r, self._size = radius, (0, 0)
+        self._pad = max(int(pad), int(math.ceil(radius - (radius - 1) / math.sqrt(2))))   # body corners stay inside the curve
         self._photo = self._bg_item = None
         super().__init__(parent, bg=bg or _parent_bg(parent, self._theme["bg"]), highlightthickness=0, bd=0,
-                         height=2 * pad + 8)
+                         height=2 * self._pad + 8)
         self.body = tk.Frame(self, bg=self._fill or self._theme["card"])
-        self._wid = self.create_window(pad, pad, window=self.body, anchor="nw")
+        self._wid = self.create_window(self._pad, self._pad, window=self.body, anchor="nw")
         self.body.bind("<Configure>", self._fit)
         self.bind("<Configure>", self._resize)
 
-    def _fit(self, _e=None):
+    def configure(self, cnf=None, **kw):
+        out = super().configure(cnf, **kw)
+        if (kw.keys() & {"bg", "background"}) and self._photo is not None:
+            self._rerender()                                          # art was flattened onto the old bg
+        return out
+    config = configure
+
+    def sync(self):
+        """Set the canvas height from the content right now. _HudPanel calls this before the first paint, because
+        <Configure> events are not delivered by update_idletasks()."""
         try:
             want = self.body.winfo_reqheight() + 2 * self._pad
             if int(self.cget("height")) != want:
                 self.configure(height=want)
         except tk.TclError:
             pass
+
+    def _fit(self, _e=None):
+        self.sync()
+
+    def _rerender(self):
+        self._size = (0, 0)
+        self._resize(type("E", (), {"width": self.winfo_width(), "height": self.winfo_height()})())
 
     def _resize(self, e):
         w, h = e.width, e.height
@@ -776,8 +830,8 @@ class RoundedCard(tk.Canvas):
             self.itemconfigure(self._wid, width=max(1, w - 2 * self._pad))
             if (w, h) != self._size:
                 self._size = (w, h)
-                self._photo = ImageTk.PhotoImage(render_card(w, h, self._r, self._fill or self._theme["card"], self._line or self._theme["line"]),
-                                                 master=self)
+                art = render_card(w, h, self._r, self._fill or self._theme["card"], self._line or self._theme["line"])
+                self._photo = ImageTk.PhotoImage(_flatten(art, _bg_rgb(self)), master=self)
                 if self._bg_item is None:
                     self._bg_item = self.create_image(0, 0, image=self._photo, anchor="nw")
                 else:
@@ -790,14 +844,12 @@ class RoundedCard(tk.Canvas):
         self._theme = theme
         self.configure(bg=bg or _parent_bg(self.master, theme["bg"]))
         self.body.configure(bg=self._fill or theme["card"])
-        self._size = (0, 0)
-        self._resize(type("E", (), {"width": self.winfo_width(), "height": self.winfo_height()})())
+        self._rerender()
 
     def set_line(self, color: str | None):
         """Recolour the hairline (e.g. accent while an input inside has focus). None = theme line."""
         self._line = color
-        self._size = (0, 0)
-        self._resize(type("E", (), {"width": self.winfo_width(), "height": self.winfo_height()})())
+        self._rerender()
 
     def destroy(self):
         self._photo = self._bg_item = None
@@ -806,23 +858,28 @@ class RoundedCard(tk.Canvas):
         except tk.TclError:
             pass
 
-
 class RoundedShell(tk.Canvas):
     """14px outer chrome for a frameless Toplevel: pack it, then build the panel inside `.body`.
 
-    Corners are made see-through with -transparentcolor on a key colour one step away from the panel colour,
-    so the antialiased rim blends into the panel colour instead of a visible fringe. Windows has no per-pixel
-    alpha for Tk widgets, so the four corners are 1-bit; the hairline hides most of the stepping."""
+    Corners are made see-through with -transparentcolor on a key colour one step away from the panel colour.
+    Windows has no per-pixel alpha for Tk widgets, so the four corners are 1-bit; the edge is snapped to the key
+    and the hairline hides most of the stepping. The body is inset far enough that its square corners stay inside
+    the curve (min_inset), otherwise they poke through the outline."""
+
+    @staticmethod
+    def min_inset(radius: int) -> int:
+        return int(math.ceil(radius - (radius - 1) / math.sqrt(2)))
 
     def __init__(self, win, theme: dict, radius: int = 14, inset: int = 3):
-        self._win, self._theme, self._r, self._inset = win, theme, radius, inset
+        self._win, self._theme, self._r = win, theme, radius
+        self._inset = max(int(inset), self.min_inset(radius))          # radius 14 -> 5
         self._size, self._photo, self._item = (0, 0), None, None
         self._line = None
         key = self._key(theme)
         super().__init__(win, bg=key, highlightthickness=0, bd=0)
         self._apply_key(key)
         self.body = tk.Frame(self, bg=theme["bg"])
-        self._wid = self.create_window(inset, inset, window=self.body, anchor="nw")
+        self._wid = self.create_window(self._inset, self._inset, window=self.body, anchor="nw")
         self.bind("<Configure>", self._resize)
 
     @staticmethod
@@ -842,11 +899,13 @@ class RoundedShell(tk.Canvas):
         if w < 8 or h < 8:
             return
         try:
-            self.itemconfigure(self._wid, width=max(1, w - 2 * self._inset), height=max(1, h - 2 * self._inset))
+            i = self._inset
+            self.itemconfigure(self._wid, width=max(1, w - 2 * i), height=max(1, h - 2 * i))
             if (w, h) != self._size:
                 self._size = (w, h)
-                self._photo = ImageTk.PhotoImage(render_card(w, h, self._r, self._theme["bg"], self._line or self._theme["line"]),
-                                                 master=self)
+                art = render_shell(w, h, self._r, self._theme["bg"], self._line or self._theme["line"],
+                                   _hex_rgb(self._key(self._theme)))
+                self._photo = ImageTk.PhotoImage(art, master=self)
                 if self._item is None:
                     self._item = self.create_image(0, 0, image=self._photo, anchor="nw")
                 else:
@@ -855,20 +914,22 @@ class RoundedShell(tk.Canvas):
         except tk.TclError:
             pass
 
+    def _rerender(self):
+        self._size = (0, 0)
+        self._resize(type("E", (), {"width": self.winfo_width(), "height": self.winfo_height()})())
+
     def retheme(self, theme: dict):
         self._theme = theme
         key = self._key(theme)
         self.configure(bg=key)
         self._apply_key(key)
         self.body.configure(bg=theme["bg"])
-        self._size = (0, 0)
-        self._resize(type("E", (), {"width": self.winfo_width(), "height": self.winfo_height()})())
+        self._rerender()
 
     def set_line(self, color: str | None):
         """Recolour the 1px hairline (the command bar lights it up in the accent while you type)."""
         self._line = color
-        self._size = (0, 0)
-        self._resize(type("E", (), {"width": self.winfo_width(), "height": self.winfo_height()})())
+        self._rerender()
 
     def destroy(self):
         self._photo = self._item = None
@@ -876,124 +937,6 @@ class RoundedShell(tk.Canvas):
             super().destroy()
         except tk.TclError:
             pass
-def render_check(size: int, c: dict, hover: bool = False, press: bool = False):
-    """Task completion circle: hollow ring -> accent ring + faint check on hover -> filled check on press."""
-    img, d, S = _aa(size, size)
-    m = 1.5
-    box = (m * S, m * S, (size - m) * S - 1, (size - m) * S - 1)
-    if press:
-        d.ellipse(box, fill=c["accent"])
-    elif hover:
-        d.ellipse(box, fill=_mixhex(c["card"], c["accent"], 0.22), outline=c["accent"], width=int(1.5 * S))
-    else:
-        d.ellipse(box, outline=_mixhex(c["muted"], c["card"], 0.15), width=int(1.5 * S))
-    if hover or press:
-        pts = [(0.30 * size * S, 0.52 * size * S), (0.44 * size * S, 0.66 * size * S), (0.72 * size * S, 0.36 * size * S)]
-        d.line(pts, fill=c["on_accent"] if press else c["accent"], width=int(1.8 * S), joint="curve")
-    return _down(img, size, size)
-
-
-def render_swatch(size: int, color: str, selected: bool, hover: bool, c: dict):
-    img, d, S = _aa(size, size)
-    cx = size / 2.0
-    g = Image.new("L", img.size, 0)
-    ImageDraw.Draw(g).ellipse(((cx - 9) * S, (cx - 9) * S, (cx + 9) * S, (cx + 9) * S), fill=255)
-    g = g.filter(ImageFilter.GaussianBlur(3 * S)).point(lambda v: int(v * (0.25 if c["light"] else 0.45)))
-    glow = Image.new("RGBA", img.size, _hex_rgb(color) + (255,))
-    glow.putalpha(g)
-    img = Image.alpha_composite(img, glow)
-    d = ImageDraw.Draw(img)
-    r = 8.0 if hover else 7.0
-    d.ellipse(((cx - r) * S, (cx - r) * S, (cx + r) * S, (cx + r) * S), fill=color, outline=c["line"], width=S)
-    if selected:
-        r2 = size / 2.0 - 1.5
-        d.ellipse(((cx - r2) * S, (cx - r2) * S, (cx + r2) * S, (cx + r2) * S), outline=c["text"], width=int(1.6 * S))
-    return _down(img, size, size)
-
-
-def render_segmented(w: int, h: int, labels, sel: int, c: dict, hover: int = -1, px: float = 9):
-    img, d, S = _aa(w, h)
-    d.rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=h * S / 2.0, fill=c["bg"], outline=c["line"], width=S)
-    n = max(1, len(labels))
-    seg = (w - 6) / n
-    f = _font(px)
-    for i, lab in enumerate(labels):
-        x0 = 3 + i * seg
-        box = (x0 * S, 3 * S, (x0 + seg) * S - 1, (h - 3) * S - 1)
-        rad = (h - 6) * S / 2.0
-        if i == sel:
-            d.rounded_rectangle(box, radius=rad, fill=c["accent"])
-            fg = c["on_accent"]
-        else:
-            if i == hover:
-                d.rounded_rectangle(box, radius=rad, fill=_mixhex(c["bg"], c["text"], 0.10))
-            fg = c["text"]
-        cx, cy = (x0 + seg / 2.0) * S, h * S / 2.0
-        try:
-            d.text((cx, cy), lab, font=f, fill=fg, anchor="mm")
-        except Exception:
-            d.text((cx - f.getlength(lab) / 2.0, cy - px * S * 0.6), lab, font=f, fill=fg)
-    return _down(img, w, h)
-
-
-def render_mini_preview(w: int, h: int, color: str, shape: str, mood_on: bool, c: dict):
-    """Live preview for the Customize panel: Mish's always-dark squircle + eyes, and the mood-tint legend."""
-    img, d, S = _aa(w, h)
-    bw, bh, pad = 144, 76, 3
-    cx, cy = 94.0, h / 2.0
-    lw, lh = (bw + 2 * pad) * S, (bh + 2 * pad) * S
-    mask = Image.new("L", (lw, lh), 0)
-    ImageDraw.Draw(mask).polygon(_squircle_points(lw / 2.0, lh / 2.0, bw / 2.0 * S, bh / 2.0 * S), fill=255)
-    inner = mask.filter(ImageFilter.MinFilter(2 * S + 1))
-    body = Image.new("RGBA", (lw, lh), NOTCH_BG + (255,))
-    body.putalpha(mask)
-    rim = Image.new("RGBA", (lw, lh), (255, 255, 255, 255))
-    rim.putalpha(ImageChops.subtract(mask, inner).point(lambda v: int(v * 0.18)))
-    grad = ImageChops.invert(Image.linear_gradient("L")).resize((lw, 18 * S), Image.Resampling.BILINEAR)
-    spec = Image.new("L", (lw, lh), 0)
-    spec.paste(grad, (0, pad * S))
-    spec = ImageChops.multiply(ImageChops.multiply(spec, inner).filter(ImageFilter.GaussianBlur(S)), mask)
-    hl = Image.new("RGBA", (lw, lh), (255, 255, 255, 255))
-    hl.putalpha(spec.point(lambda v: int(v * 0.16)))
-    sq = Image.alpha_composite(Image.alpha_composite(body, rim), hl)
-
-    ew, eh, rad = SHAPE_DIMS.get(shape, SHAPE_DIMS["pill"])
-    rgb = _hex_rgb(color)
-    em = Image.new("L", (lw, lh), 0)
-    ed = ImageDraw.Draw(em)
-    for sgn in (-1, 1):
-        ex, ey = lw / 2.0 + sgn * (10 + ew / 2.0) * S, lh / 2.0 - 6 * S
-        ed.rounded_rectangle((ex - ew * S / 2.0, ey - eh * S / 2.0, ex + ew * S / 2.0 - 1, ey + eh * S / 2.0 - 1),
-                             radius=min(rad * S, ew * S / 2.0, eh * S / 2.0), fill=255)
-    glow = Image.new("RGBA", (lw, lh), rgb + (255,))
-    glow.putalpha(em.filter(ImageFilter.GaussianBlur(3.5 * S)).point(lambda v: int(v * 0.55)))
-    eyes = Image.new("RGBA", (lw, lh), rgb + (255,))
-    eyes.putalpha(em)
-    sq = Image.alpha_composite(sq, glow)
-    sq = Image.alpha_composite(sq, eyes)
-    sd = ImageDraw.Draw(sq)
-    f = _font(9)
-    try:
-        sd.ellipse((lw / 2.0 - 26 * S, lh / 2.0 + 21 * S, lw / 2.0 - 20 * S, lh / 2.0 + 27 * S), fill=(255, 255, 255, 255))
-        sd.text((lw / 2.0 - 14 * S, lh / 2.0 + 24 * S), "idle", font=f, fill=(226, 232, 240, 255), anchor="lm")
-    except Exception:
-        pass
-    img.alpha_composite(sq, (int((cx - bw / 2.0 - pad) * S), int((cy - bh / 2.0 - pad) * S)))
-
-    d = ImageDraw.Draw(img)                                           # mood legend (dimmed when tints are off)
-    items = (("happy", STATE_RGB["happy"]), ("curious", STATE_RGB["curious"]),
-             ("alert", STATE_RGB["scared"]), ("sleepy", STATE_RGB["sleepy"]))
-    off = _hex_rgb(_mixhex(c["muted"], c["card"], 0.45))
-    for i, (name, col) in enumerate(items):
-        y = h / 2.0 - 25.5 + i * 17
-        colr = col if mood_on else off
-        d.ellipse((190 * S, (y - 4) * S, 198 * S, (y + 4) * S), fill=colr)
-        try:
-            d.text((206 * S, y * S), name, font=f, fill=c["text"] if mood_on else c["muted"], anchor="lm")
-        except Exception:
-            d.text((206 * S, (y - 6) * S), name, font=f, fill=c["text"] if mood_on else c["muted"])
-    return _down(img, w, h)
-
 
 class CheckCircle(_PilCanvas):
     """20px completion circle for task rows. command() fires on a click released inside the circle."""
@@ -1132,13 +1075,16 @@ class MiniPreview(_PilCanvas):
 
 class _HudPanel(tk.Toplevel):
     """Base for every HUD popover: 14px RoundedShell chrome, theme palette from face.theme, rebuild() on theme
-    change. Subclasses implement _build(body) (+ _snapshot()/_restore() to keep typed text across a rebuild)."""
-    WIDTH, INSET = 340, 3
+    change. Subclasses implement _build(body) (+ _snapshot()/_restore() to keep typed text across a rebuild).
+    The panel is measured and sized before it is shown, so it opens at its final width and height."""
+    WIDTH, INSET = 340, 5
+    BOTTOM_PAD = 12                                # space under the last row, same on every panel
 
     def __init__(self, face):
         super().__init__(face.root)
         self.face = face
         self._geo_set, self._tick_id = False, None
+        self._fitting, self._last_h = False, 0
         self.withdraw()
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -1154,12 +1100,12 @@ class _HudPanel(tk.Toplevel):
             x = max(l + 10, wx - self.WIDTH - 12)
         self._pos = (int(x), int(max(t + 10, wy)))
         self._build(self.body)
-        self._fit()
+        self._fit()                                # full size BEFORE the first paint
         self.bind("<Escape>", lambda e: self.destroy())
         self.body.bind("<Configure>", lambda _e: self._fit(), add="+")
         self.deiconify()
-        self._fit()
-        self.after_idle(self._fit)
+        self.after_idle(self._fit)                 # cheap safety passes for late font / wrap changes
+        self.after(80, self._fit)
         self.focus_force()
 
     # ---- palette / sizing / rebuild ----
@@ -1170,17 +1116,33 @@ class _HudPanel(tk.Toplevel):
         c["amber"] = "#d97706" if light else "#fbbf24"
         return c
 
+    def _sync_cards(self, widget):
+        """Post-order walk: inner cards (input wells) are sized before the cards that contain them."""
+        for ch in widget.winfo_children():
+            self._sync_cards(ch)
+            if isinstance(ch, RoundedCard):
+                ch.sync()
+
     def _fit(self):
+        if self._fitting:
+            return
+        self._fitting = True
         try:
-            self.update_idletasks()
-            h = min(self.body.winfo_reqheight() + 2 * self.INSET, self.face.root.winfo_screenheight() - 40)
+            for _ in range(3):                     # nested cards need a geometry pass between syncs
+                self._sync_cards(self.body)
+                self.update_idletasks()
+            h = min(self.body.winfo_reqheight() + 2 * self.shell._inset, self.face.root.winfo_screenheight() - 40)
             if not self._geo_set:
                 self._geo_set = True
+                self._last_h = h
                 self.geometry(f"{self.WIDTH}x{h}+{self._pos[0]}+{self._pos[1]}")
-            else:
+            elif h != self._last_h:
+                self._last_h = h
                 self.geometry(f"{self.WIDTH}x{h}")
         except tk.TclError:
             pass
+        finally:
+            self._fitting = False
 
     def rebuild(self):
         """Re-skin in place (theme / accent changed). Keeps position and any typed text."""
@@ -1255,7 +1217,6 @@ class _HudPanel(tk.Toplevel):
         except tk.TclError:
             pass
 
-
 class TaskPanel(_HudPanel):
     """Active tasks (local only). Reads/writes the same memory.json as Mish and polls it every second."""
     LIST_H = 250
@@ -1290,7 +1251,7 @@ class TaskPanel(_HudPanel):
         self.status.pack(fill="x", padx=16, pady=(2, 4))
         self.entry.bind("<Return>", self.add)
 
-        card = self._card(body, pady=(0, 14))
+        card = self._card(body, pady=(0, self.BOTTOM_PAD))
         self.canvas = tk.Canvas(card.body, bg=c["card"], height=self.LIST_H, width=10, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
         self.rows = tk.Frame(self.canvas, bg=c["card"])
@@ -1395,8 +1356,9 @@ class CustomizeStudio(_HudPanel):
     """MISH // STUDIO: theme-aware, every change saved and previewed live (mini Mish on top)."""
     SHAPES = (("Pill", "pill"), ("Round", "round"), ("Slim", "slim"), ("Visor", "visor"), ("Square", "square"))
     THEMES_OPTS = (("Auto", "auto"), ("Dark", "dark"), ("Light", "light"))
-    INNER = 286                                    # WIDTH 340 - 2*inset - 2*14 outer pad - 2*10 card pad
-
+    @property
+    def INNER(self) -> int:                        # panel width - shell insets - 2*14 outer pad - 2*10 card pad
+        return self.WIDTH - 2 * self.shell._inset - 2 * 14 - 2 * 10
     def __init__(self, face):
         self.s = face.settings
         super().__init__(face)
@@ -1446,7 +1408,7 @@ class CustomizeStudio(_HudPanel):
         self.mood_sw.pack(side="right")
 
         foot = tk.Frame(body, bg=c["bg"])
-        foot.pack(fill="x", padx=14, pady=(4, 20))
+        foot.pack(fill="x", padx=14, pady=(6, self.BOTTOM_PAD))
         PillButton(foot, "Reset", self._reset, th, acc, height=28, bg=c["bg"]).pack(side="left")
         PillButton(foot, "Done", self.destroy, th, acc, kind="primary", height=28, bg=c["bg"]).pack(side="right")
 
@@ -1544,7 +1506,7 @@ class ConnectionsPanel(_HudPanel):
         well.pack(side="left", fill="x", expand=True)
 
         foot = tk.Frame(body, bg=c["bg"])
-        foot.pack(fill="x", padx=14, pady=(2, 14))
+        foot.pack(fill="x", padx=14, pady=(2, self.BOTTOM_PAD))
         PillButton(foot, "Sync All Now", self._sync_all, th, acc, kind="primary", height=28, bg=c["bg"]).pack(side="left")
         PillButton(foot, "Edit Config JSON", self.hub.open_config_file, th, acc, height=28, bg=c["bg"]).pack(side="right")
 
@@ -1649,6 +1611,148 @@ class ConnectionsPanel(_HudPanel):
         except tk.TclError:
             pass
 
+class DevConsole(tk.Toplevel):
+    """Plain-Tk developer console: live telemetry, quick triggers and a command line.
+    No RoundedShell / PIL. Commands run on a worker thread; results return through the UI queue."""
+    W, H = 480, 470
+    BG, FIELD, FG, DIM, ACC, HOVER = "#111318", "#1A1D24", "#E2E8F0", "#64748b", "#34d399", "#262b36"
+    FONT = ("Consolas", 9)
+
+    def __init__(self, face):
+        super().__init__(face.root)
+        self.face, self.mish = face, face.mish
+        self._tick_id = None
+        self.title("Mish Dev Console")
+        self.configure(bg=self.BG)
+        self.attributes("-topmost", True)
+        self.minsize(380, 320)
+        self._build()
+        self._dock()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.log("Dev console ready. Type help() for commands.")
+        self._tick()
+        self.cmd.focus_set()
+
+    # ---- widgets ----
+    def _button(self, parent, text, command):
+        return tk.Button(parent, text=text, command=command, bg=self.FIELD, fg=self.FG, activebackground=self.HOVER,
+                         activeforeground=self.FG, relief="flat", bd=0, font=("Consolas", 8), padx=8, pady=3,
+                         cursor="hand2")
+
+    def _entry(self, parent, width=None):
+        e = tk.Entry(parent, bg=self.FIELD, fg=self.FG, insertbackground=self.FG, relief="flat", bd=0,
+                     highlightthickness=1, highlightbackground=self.HOVER, highlightcolor=self.ACC, font=self.FONT)
+        if width:
+            e.configure(width=width)
+        return e
+
+    def _build(self):
+        self.status = tk.Label(self, text="", bg=self.BG, fg=self.ACC, font=self.FONT, justify="left", anchor="w")
+        self.status.pack(fill="x", padx=10, pady=(8, 6))
+
+        act = tk.Frame(self, bg=self.BG)
+        act.pack(fill="x", padx=10)
+        self.param = self._entry(act, 22)
+        self.param.insert(0, "fedup(85)")
+        self.param.pack(side="left", ipady=3)
+        self.param.bind("<Return>", lambda e: self._run(self.param.get()))
+        self._button(act, "Run", lambda: self._run(self.param.get())).pack(side="left", padx=(6, 0))
+
+        quick = tk.Frame(self, bg=self.BG)
+        quick.pack(fill="x", padx=10, pady=(6, 6))
+        for label, cmd in (("Fire Gaming", "fire(gaming)"), ("Fire Nag", "fire(nag)"),
+                           ("Last Prompt", "prompt()"), ("Toggle Timers", "toggle_timers()")):
+            self._button(quick, label, lambda c=cmd: self._run(c)).pack(side="left", padx=(0, 6))
+
+        mid = tk.Frame(self, bg=self.BG)
+        mid.pack(fill="both", expand=True, padx=10)
+        sb = tk.Scrollbar(mid, orient="vertical")
+        self.out = tk.Text(mid, bg=self.FIELD, fg=self.FG, font=self.FONT, relief="flat", bd=0, wrap="word",
+                           state="disabled", highlightthickness=0, yscrollcommand=sb.set, height=10)
+        sb.configure(command=self.out.yview)
+        sb.pack(side="right", fill="y")
+        self.out.pack(side="left", fill="both", expand=True)
+
+        bar = tk.Frame(self, bg=self.BG)
+        bar.pack(fill="x", padx=10, pady=(6, 10))
+        tk.Label(bar, text=">", bg=self.BG, fg=self.ACC, font=("Consolas", 10, "bold")).pack(side="left")
+        self.cmd = self._entry(bar)
+        self.cmd.pack(side="left", fill="x", expand=True, padx=(6, 0), ipady=3)
+        self.cmd.bind("<Return>", self._submit)
+
+    def _dock(self):
+        """Sit beside Mish (right side, or left if there is no room), clamped to his monitor."""
+        f = self.face
+        l, t, r, b = f._monitor_rect()
+        wx, wy = f._win_xy()
+        x = wx + f.root.winfo_width() + 12
+        if x + self.W > r:
+            x = max(l + 10, wx - self.W - 12)
+        y = int(clamp(wy, t + 10, max(t + 10, b - self.H - 60)))
+        self.geometry(f"{self.W}x{self.H}+{int(x)}+{y}")
+
+    # ---- output / commands ----
+    def log(self, text: str):
+        try:
+            self.out.configure(state="normal")
+            self.out.insert("end", str(text) + "\n")
+            if int(self.out.index("end-1c").split(".")[0]) > 500:       # keep the pane small
+                self.out.delete("1.0", "100.0")
+            self.out.see("end")
+            self.out.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def _submit(self, _e=None):
+        txt = self.cmd.get().strip()
+        self.cmd.delete(0, "end")
+        self._run(txt)
+
+    def _run(self, cmd: str):
+        cmd = cmd.strip()
+        if not cmd:
+            return
+        self.log(f"> {cmd}")
+        threading.Thread(target=self._exec, args=(cmd,), daemon=True).start()
+
+    def _exec(self, cmd: str):
+        """Worker thread: nothing here touches Tk; the result goes back through the UI queue."""
+        m = self.mish
+        try:
+            if m.is_dev_cmd(cmd):
+                out = m.run_dev_cmd(cmd)
+            elif cmd.startswith("!"):
+                out = m.handle_bang(cmd)
+                if out:
+                    m.say(out)                                  # same bubble he would show from the chat box
+            else:
+                m.handle_user_input(cmd)
+                out = "(sent to Mish as chat)"
+        except Exception as e:
+            out = f"error: {e!r}"
+        self.face.ui.put(("dev_out", out or "(no output)"))
+
+    # ---- live telemetry ----
+    def _tick(self):
+        try:
+            if not self.winfo_exists():
+                return
+            self.status.configure(text=self.mish.dev_status_text())
+            self._tick_id = self.after(1000, self._tick)
+        except tk.TclError:
+            pass
+
+    def destroy(self):
+        if self._tick_id is not None:
+            try:
+                self.after_cancel(self._tick_id)
+            except Exception:
+                pass
+            self._tick_id = None
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
 
 class RobotFaceWindow:
     P_SIZE = 4                 # screen pixels per "16-bit" pixel
@@ -1901,6 +2005,33 @@ class RobotFaceWindow:
             except tk.TclError:
                 pass
         self.cust = CustomizeStudio(self)
+
+    def open_dev_console(self):
+        win = getattr(self, "dev_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                return
+        except tk.TclError:
+            pass
+        self.dev_win = DevConsole(self)
+
+    def close_dev_console(self):
+        win = getattr(self, "dev_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.destroy()
+        except tk.TclError:
+            pass
+        self.dev_win = None
+
+    def dev_out(self, text: str):
+        win = getattr(self, "dev_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.log(text)
+        except tk.TclError:
+            pass
 
     # ---- speech bubbles, menu, chat box -------------------------------------------------
     def show_speech_bubble(self, text: str, duration: int | None = None, timer: bool = False):
@@ -2185,14 +2316,17 @@ class RobotFaceWindow:
                         self.root.withdraw()
                     elif kind == "summon":
                         self.summon()
-                    elif kind == "connections": 
+                    elif kind == "connections":
                         self.open_connections()
+                    elif kind == "dev_panel":
+                        self.open_dev_console() if item[1] else self.close_dev_console()
+                    elif kind == "dev_out":
+                        self.dev_out(item[1])
                 except Exception as e:
                     log("ui event failed:", kind, repr(e))
         except queue.Empty:
             pass
         self.root.after(150, self.poll)
-
 
 _SS = 4                                         # supersampling factor
 _FONT_CACHE: dict = {}
@@ -2368,6 +2502,8 @@ class LayeredMishWindow(RobotFaceWindow):
         self._invalidate()
         self._compose()
         self._apply()
+        if self.settings.get("dev", 0) == 1:
+            root.after(600, self.open_dev_console)
 
     def _wma_proxy(self, *a, **kw):
         """Intercept the two Tk attributes that fight with UpdateLayeredWindow; everything else passes through."""
@@ -2646,6 +2782,7 @@ class LayeredMishWindow(RobotFaceWindow):
             "strike": self.mish.strike_mode, "sleeping": self.is_sleeping, "scared": self.is_scared,
             "dizzy": self.is_dizzy, "held": self.is_held, "thinking": self.mish.thinking_visible,
             "listening": self.is_listening, "focus": self.mish.in_focus(), "idle_t": self.idle_t,
+            "annoyance": self.mish.annoyance,
             "pointer": pointer, "face": (wx + self.FACE_CENTER[0], wy + self.FACE_CENTER[1]), "inertia": inertia,
         })
         st = self._visual_state(now, pointer)
@@ -3157,7 +3294,7 @@ class LayeredMishWindow(RobotFaceWindow):
         th = self.theme
         c = ui_colors(th, self.eye_col)
         BG, MUTED, accent = c["bg"], c["muted"], c["accent"]
-        W, H = 316, 40
+        W, H = 316, 42
         l, t, r, b = self._monitor_rect()
         wx, wy = self._win_xy()
         floating = self._mode == "float"
@@ -3242,11 +3379,13 @@ class LayeredMishWindow(RobotFaceWindow):
             ("Pop Out" if d else "Tuck to Top Notch", "", self.pop_out if d else self.tuck_to_top, False),
             ("Session Stats", "", lambda: self.show_speech_bubble(self.mish.stats_text()), False),
             ("Customize HUD...", "", self.open_customize, False),
-            None,
-            ("Exit Mish", "", self.root.destroy, True),
         ]
+        if self.settings.get("dev", 0) == 1:
+            items.append(("Dev Console", "", self.open_dev_console, False))
+        items += [None, ("Exit Mish", "", self.root.destroy, True)]
         self._ctx = GhostMenu(self.root, items, int(x), int(y), accent=self.eye_col,
                               bounds=self._monitor_rect(), theme=self.theme)
+
     def show_menu(self):
         x, y = self._win_xy()
         self.open_context_menu(x + self.GEAR_RECT[0], y + self.GEAR_RECT[3])
