@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
-import icalendar
-import requests
 
 from ..config import user_data_dir
 from ..win_utils import log
@@ -47,6 +45,9 @@ class BlackboardSync:
         if not self.ics_url:
             return []
         try:
+            import icalendar
+            import requests
+
             resp = requests.get(
                 self.ics_url,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},

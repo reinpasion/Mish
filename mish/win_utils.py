@@ -235,19 +235,6 @@ def classify_detail(title: str, app: str) -> str:
     return "neutral"
 
 
-def detail_to_cat(detail: str) -> str:
-    """Backward-compatible 3-way category used by stats and focus punishment."""
-    if detail in ("game", "media", "social"):
-        return "slack"
-    if detail in ("code", "work"):
-        return "work"
-    return "neutral"
-
-
-def classify(title: str, app: str) -> str:
-    return detail_to_cat(classify_detail(title, app))
-
-
 # ---- friendly names --------------------------------------------------------------------
 _BROWSER_EXES = {"chrome", "msedge", "firefox", "zen", "brave", "opera", "opera_gx", "vivaldi", "arc", "chromium"}
 _BROWSER_NAMES = r"(?:Google Chrome|Microsoft\W{0,3}Edge|Mozilla Firefox|Zen Browser|Brave|Opera(?: GX)?|Vivaldi|Arc|Chromium)"
@@ -470,7 +457,7 @@ class Store:
         self.path = Path(path)
         self.lock = threading.RLock()
         self._dirty = False
-        self.data = self._load()
+        self.data, needs_save = self._load()
         self.on_complete = None
         self._changes = threading.Condition(self.lock)
         self._revision = self._written_revision = 0
@@ -479,20 +466,27 @@ class Store:
         self._closing = False
         self._writer = threading.Thread(target=self._write_loop, name="mish-store-writer", daemon=True)
         self._writer.start()
-        self.save()
+        if needs_save:
+            self.save()
 
     @staticmethod
     def _defaults() -> dict:
         return {"tasks": [], "facts": {}, "chat_history": [], "stats": {},
                 "next_id": 1, "activity": [], "last_decay": None}
 
-    def _load(self) -> dict:
+    def _load(self) -> tuple[dict, bool]:
+        """Return memory and whether startup needs to persist new or recovered data."""
         data = self._defaults()
+        needs_save = True
         bak = self.path.with_suffix(".json.bak")
         for candidate in (self.path, bak):
             if candidate.exists():
                 try:
-                    data.update(json.loads(candidate.read_text(encoding="utf-8")))
+                    saved = json.loads(candidate.read_text(encoding="utf-8"))
+                    if not isinstance(saved, dict):
+                        raise ValueError("memory must contain a JSON object")
+                    needs_save = candidate == bak or not data.keys() <= saved.keys()
+                    data.update(saved)
                     if candidate == bak:
                         log("memory restored from backup")
                     break
@@ -506,9 +500,11 @@ class Store:
         facts = data.get("facts")
         if isinstance(facts, list):                      # old format: a plain list of strings
             data["facts"] = {f: 3.0 for f in facts if isinstance(f, str)}
+            needs_save = True
         elif not isinstance(facts, dict):
             data["facts"] = {}
-        return data
+            needs_save = True
+        return data, needs_save
 
     def _check_open(self):
         if self._closing:

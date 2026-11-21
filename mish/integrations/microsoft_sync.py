@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import msal
-import requests
 
 from ..config import user_data_dir
 from ..win_utils import log
@@ -18,25 +18,51 @@ class MicrosoftSync:
         self.base_dir = base_dir or user_data_dir()
         self.cache_file = self.base_dir / "ms_token.json"
         self.state_file = self.base_dir / "ms_synced.json"
-        self.cache = msal.SerializableTokenCache()
-        if self.cache_file.exists():
-            self.cache.deserialize(self.cache_file.read_text(encoding="utf-8"))
-        self.client_id = ""
-        self.app = None
-        self.configure(client_id)
+        self.client_id = (client_id or "").strip()
+        self._cache = None
+        self._app = None
+        self._client_ready = threading.Condition()
+        self._client_busy = False
         self._state = self._load_state()
 
+    @contextmanager
+    def _client_operation(self):
+        with self._client_ready:
+            self._client_ready.wait_for(lambda: not self._client_busy)
+            self._client_busy = True
+        try:
+            yield
+        finally:
+            with self._client_ready:
+                self._client_busy = False
+                self._client_ready.notify_all()
+
     def configure(self, client_id: str):
-        self.client_id = (client_id or "").strip()
-        self.app = (
-            msal.PublicClientApplication(
-                self.client_id,
-                authority="https://login.microsoftonline.com/common",
-                token_cache=self.cache,
-            )
-            if self.client_id
-            else None
+        with self._client_operation():
+            client_id = (client_id or "").strip()
+            if client_id != self.client_id:
+                self.client_id = client_id
+                self._app = None
+                self._cache = None
+
+    def disconnect(self):
+        with self._client_operation():
+            self.cache_file.unlink(missing_ok=True)
+            self._app = None
+            self._cache = None
+
+    def _init_app(self):
+        from msal import PublicClientApplication, SerializableTokenCache
+
+        cache = SerializableTokenCache()
+        if self.cache_file.is_file():
+            cache.deserialize(self.cache_file.read_text(encoding="utf-8"))
+        app = PublicClientApplication(
+            self.client_id,
+            authority="https://login.microsoftonline.com/common",
+            token_cache=cache,
         )
+        self._cache, self._app = cache, app
 
     def _load_state(self) -> dict:
         try:
@@ -46,26 +72,39 @@ class MicrosoftSync:
             pass
         return {"items": {}, "notified_msgs": []}
 
-    def _save_all(self):
+    def _save_state(self):
         try:
-            if self.cache.has_state_changed:
-                self.cache_file.write_text(self.cache.serialize(), encoding="utf-8")
             self.state_file.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
         except Exception as e:
             log("ms: save failed:", repr(e))
 
     def _token(self, interactive: bool = False) -> str | None:
-        if not self.app:
+        try:
+            with self._client_operation():
+                if not self.client_id:
+                    return None
+                if self._app is None:
+                    if not interactive and not self.cache_file.is_file():
+                        return None
+                    self._init_app()
+                accounts = self._app.get_accounts()
+                res = self._app.acquire_token_silent(MS_SCOPES, account=accounts[0]) if accounts else None
+                if not res and interactive:
+                    res = self._app.acquire_token_interactive(scopes=MS_SCOPES)
+                if self._cache.has_state_changed:
+                    try:
+                        self.cache_file.write_text(self._cache.serialize(), encoding="utf-8")
+                    except Exception as error:
+                        log("ms: token save failed:", repr(error))
+                return res.get("access_token") if res else None
+        except Exception as error:
+            if interactive:
+                raise
+            log("ms: silent auth failed:", repr(error))
             return None
-        accounts = self.app.get_accounts()
-        res = self.app.acquire_token_silent(MS_SCOPES, account=accounts[0]) if accounts else None
-        if not res and interactive:
-            res = self.app.acquire_token_interactive(scopes=MS_SCOPES)
-        self._save_all()
-        return res.get("access_token") if res else None
 
     def authorize_interactive(self) -> tuple[bool, str]:
-        if not self.app:
+        if not self.client_id:
             return False, "Set 'microsoft_client_id' in integrations.json first (or use !msid <client_id>)."
         try:
             ok = self._token(interactive=True) is not None
@@ -82,6 +121,11 @@ class MicrosoftSync:
         added: list[str] = []
         seen = self._state.setdefault("items", {})
 
+        try:
+            import requests
+        except ImportError as error:
+            log("ms: requests unavailable:", repr(error))
+            return []
         try:
             now = datetime.now(timezone.utc)
             params = {
@@ -137,7 +181,7 @@ class MicrosoftSync:
         except Exception as e:
             log("ms: todo sync failed:", repr(e))
 
-        self._save_all()
+        self._save_state()
         return added
 
     def poll_priority_mail(self, ui_queue, keywords=("urgent", "deadline", "exam", "assignment")):
@@ -145,6 +189,8 @@ class MicrosoftSync:
         if not tok:
             return
         try:
+            import requests
+
             r = requests.get(
                 f"{GRAPH_ROOT}/me/mailFolders/Inbox/messages",
                 headers={"Authorization": f"Bearer {tok}"},
@@ -162,7 +208,7 @@ class MicrosoftSync:
                 ui_queue.put(("say", f"Priority Outlook mail from {sender}: {subj}", "surprised"))
                 seen.append(mid)
             self._state["notified_msgs"] = seen[-200:]
-            self._save_all()
+            self._save_state()
         except Exception as e:
             log("ms: mail poll failed:", repr(e))
 
@@ -178,6 +224,8 @@ class MicrosoftSync:
             }
         }
         try:
+            import requests
+
             r = requests.post(
                 f"{GRAPH_ROOT}/me/sendMail",
                 headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},

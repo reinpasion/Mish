@@ -12,16 +12,29 @@ import queue
 import threading
 import time
 import tkinter as tk
-import pystray
 import ctypes.wintypes as _wt
 import random
 import winreg
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageTk
 
 from .config import AUTO_SLEEP_TIMEOUT, FOCUS_DEFAULT_MIN, HOTKEY_MOD, HOTKEY_VK, user_data_dir
-from .eyes import ProfileEyeEngine, annoyance_tier, effective_eye_shape, is_eye_shape_pinned
+from .eyes import (
+    EXPRESSIONS,
+    GLYPHS,
+    STATE_RGB,
+    ProfileEyeEngine,
+    _hex_rgb,
+    _mix,
+    _rgb_hex,
+    annoyance_tier,
+    effective_eye_shape,
+    is_eye_shape_pinned,
+    pick_expression,
+    speech_duration_ms,
+)
 from .win_utils import (
     _LayeredSurface,
     _MONINFO,
@@ -32,19 +45,7 @@ from .win_utils import (
     log,
     parse_when,
 )
-from .brain import (
-    BG_PRESETS,
-    EXPRESSIONS,
-    EYE_PRESETS,
-    GLYPHS,
-    STATE_RGB,
-    Mish,
-    _hex_rgb,
-    _mix,
-    _rgb_hex,
-    pick_expression,
-    speech_duration_ms,
-)
+from .brain import EYE_PRESETS, Mish
 
 # ---- easing curves: t runs 0 -> 1 ----------------------------------------------------
 def ease_in_cubic(t: float) -> float:
@@ -613,20 +614,11 @@ class PillButton(_PilCanvas):
         if was and self._enabled and 0 <= e.x < self.w and 0 <= e.y < self.h and self._command:
             self._command()
 
-    def invoke(self):
-        if self._enabled and self._command:
-            self._command()
-
     def set_text(self, text: str):
         self._text = text
         if not self._fixed_w:
             self.w = int(math.ceil(_measure(text, self._px))) + 2 * self._padx
             self.configure(width=self.w)
-        self._draw()
-
-    def set_enabled(self, on: bool):
-        self._enabled = bool(on)
-        self.configure(cursor="hand2" if on else "arrow")
         self._draw()
 
     def set_kind(self, kind: str):
@@ -1577,7 +1569,9 @@ class ConnectionsPanel(_HudPanel):
     WIDTH = 360
 
     def __init__(self, face):
-        self.hub = face.mish.hub
+        self._status = None
+        self._pending = False
+        self._queued_action = None
         super().__init__(face)
         self._tick()
 
@@ -1631,27 +1625,77 @@ class ConnectionsPanel(_HudPanel):
         foot = tk.Frame(body, bg=c["bg"])
         foot.pack(fill="x", padx=14, pady=(2, self.BOTTOM_PAD))
         PillButton(foot, "Sync All Now", self._sync_all, th, acc, kind="primary", height=28, bg=c["bg"]).pack(side="left")
-        PillButton(foot, "Edit Config JSON", self.hub.open_config_file, th, acc, height=28, bg=c["bg"]).pack(side="right")
+        PillButton(foot, "Edit Config JSON", self._edit_config, th, acc, height=28, bg=c["bg"]).pack(side="right")
 
-        st = self.hub.status()
-        if st["bb_url"]:
-            self.bb_entry.insert(0, st["bb_url"])
-        if st["ms_client_id"]:
-            self.ms_entry.insert(0, st["ms_client_id"])
+        self._fill_saved_fields()
         self._refresh()
+
+    def _fill_saved_fields(self):
+        if self._status is None:
+            return
+        for field, key in ((self.bb_entry, "bb_url"), (self.ms_entry, "ms_client_id")):
+            if not field.get() and self._status[key]:
+                field.insert(0, self._status[key])
 
     def _note(self, text, color=None):
         self.status_bar.configure(text=text, fg=color or self.c["accent"])
+
+    def _run_hub_task(self, action=None):
+        if self._pending:
+            if action is not None:
+                if self._queued_action is None:
+                    self._queued_action = action
+                else:
+                    self._note("Connections is busy. Try again in a moment.", self.c["amber"])
+            return
+        self._pending = True
+        mish, out = self.face.mish, self.face.ui
+
+        def work():
+            status = note = None
+            try:
+                hub = mish.hub
+                if action is not None:
+                    note = action(hub)
+                status = hub.status()
+            except Exception as error:
+                log("connections:", repr(error))
+                note = ("Connections could not complete the request.", "rose")
+            out.put(("connections_result", self, status, note))
+
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception:
+            self._pending = False
+            raise
+
+    def _receive_result(self, status, note):
+        self._pending = False
+        if status is not None:
+            first_status = self._status is None
+            self._status = status
+            if first_status:
+                self._fill_saved_fields()
+            self._refresh()
+        if note is not None:
+            message, color = note
+            self._note(message, self.c[color])
+        if self._queued_action is not None:
+            action, self._queued_action = self._queued_action, None
+            self._run_hub_task(action)
 
     def _save_bb(self):
         url = self.bb_entry.get().strip()
         if not url:
             self._note("Paste your Blackboard .ics link first.", self.c["rose"])
             return
-        self.hub.set_blackboard_url(url)
-        self._note("Saved Blackboard URL â€” syncing...", self.c["green"])
-        self.hub.sync_now_async(announce_empty=True)
-        self.after(1500, self._refresh)
+
+        def action(hub):
+            hub.set_blackboard_url(url)
+            hub.sync_now_async(announce_empty=True)
+            return "Saved Blackboard URL. Syncing...", "green"
+
+        self._run_hub_task(action)
 
     def _pick_google_json(self):
         from tkinter import filedialog
@@ -1659,36 +1703,47 @@ class ConnectionsPanel(_HudPanel):
                                           filetypes=[("JSON files", "*.json")])
         if not path:
             return
-        ok, msg = self.hub.install_google_creds(path)
-        self._note(msg, self.c["green"] if ok else self.c["rose"])
-        self._refresh()
+
+        def action(hub):
+            ok, msg = hub.install_google_creds(path)
+            return msg, "green" if ok else "rose"
+
+        self._run_hub_task(action)
 
     def _toggle_google(self):
-        if self.hub.status()["google_connected"]:
-            self.hub.disconnect_google()
-            self._note("Google disconnected.", self.c["amber"])
-            self._refresh()
-        else:
-            self._note("Opening browser for Google sign-in...")
-            self.hub.connect_google_async()
+        def action(hub):
+            if hub.status()["google_connected"]:
+                hub.disconnect_google()
+                return "Google disconnected.", "amber"
+            hub.connect_google_async()
+            return "Opening browser for Google sign-in...", "accent"
+
+        self._run_hub_task(action)
 
     def _toggle_ms(self):
-        if self.hub.status()["ms_connected"]:
-            self.hub.disconnect_microsoft()
-            self._note("Microsoft disconnected.", self.c["amber"])
-            self._refresh()
-        else:
-            cid = self.ms_entry.get().strip()
-            if not cid:
-                self._note("Paste your Azure App Client ID first.", self.c["rose"])
-                return
-            self.hub.set_ms_client_id(cid)
-            self._note("Opening browser for Microsoft sign-in...")
-            self.hub.connect_microsoft_async()
+        cid = self.ms_entry.get().strip()
+
+        def action(hub):
+            if hub.status()["ms_connected"]:
+                if hub.disconnect_microsoft_async():
+                    return "Microsoft disconnect requested.", "amber"
+            elif not cid:
+                return "Paste your Azure App Client ID first.", "rose"
+            elif hub.connect_microsoft_async(cid):
+                return "Opening browser for Microsoft sign-in...", "accent"
+            return "A Microsoft account action is already running.", "amber"
+
+        self._run_hub_task(action)
 
     def _sync_all(self):
-        self._note("Syncing Blackboard, Google & Microsoft...")
-        self.hub.sync_now_async(announce_empty=True)
+        def action(hub):
+            hub.sync_now_async(announce_empty=True)
+            return "Syncing Blackboard, Google & Microsoft...", "accent"
+
+        self._run_hub_task(action)
+
+    def _edit_config(self):
+        self._run_hub_task(lambda hub: hub.open_config_file())
 
     @staticmethod
     def _btn_state(btn, text: str, kind: str):
@@ -1699,13 +1754,15 @@ class ConnectionsPanel(_HudPanel):
 
     def _refresh(self):
         try:
-            c, st = self.c, self.hub.status()
+            c, st = self.c, self._status
+            if st is None:
+                return
             if st["bb_connected"]:
                 self.bb_badge.configure(text=f"\u25cf LINKED ({st['bb_count']})", fg=c["green"])
             else:
                 self.bb_badge.configure(text="\u25cb NOT SET", fg=c["muted"])
             if st["google_connected"]:
-                self.g_badge.configure(text="\u25cf CONNECTED", fg=c["green"])
+                self.g_badge.configure(text="\u25cf SIGN-IN SAVED", fg=c["green"])
                 self._btn_state(self.g_btn, "Disconnect", "danger")
             elif st["google_has_creds"]:
                 self.g_badge.configure(text="\u25cf READY TO SIGN IN", fg=c["amber"])
@@ -1714,7 +1771,7 @@ class ConnectionsPanel(_HudPanel):
                 self.g_badge.configure(text="\u25cb NO CREDENTIALS.JSON", fg=c["muted"])
                 self._btn_state(self.g_btn, "Connect", "secondary")
             if st["ms_connected"]:
-                self.ms_badge.configure(text="\u25cf CONNECTED", fg=c["green"])
+                self.ms_badge.configure(text="\u25cf SIGN-IN SAVED", fg=c["green"])
                 self._btn_state(self.ms_btn, "Disconnect", "danger")
             elif st["ms_client_id"]:
                 self.ms_badge.configure(text="\u25cf READY TO SIGN IN", fg=c["amber"])
@@ -1729,7 +1786,7 @@ class ConnectionsPanel(_HudPanel):
         try:
             if not self.winfo_exists():
                 return
-            self._refresh()
+            self._run_hub_task()
             self._tick_id = self.after(1500, self._tick)
         except tk.TclError:
             pass
@@ -1884,7 +1941,7 @@ class RobotFaceWindow:
     FACE_CENTER = (108, 48)    # between the eyes, inside the window (for mouse-following)
     SIZE = (240, 130)
 
-    def __init__(self, root: tk.Tk, mish: Mish, ui_queue: queue.Queue):
+    def __init__(self, root: tk.Tk, mish: Mish, ui_queue: queue.Queue, *, defer_start: bool = False):
         self.root, self.mish, self.ui = root, mish, ui_queue
         self.settings = mish.settings
         self.eyes = ProfileEyeEngine()
@@ -1894,7 +1951,8 @@ class RobotFaceWindow:
         self._derive_theme()
 
         root.title("Mish")
-        root.geometry(f"{self.SIZE[0]}x{self.SIZE[1]}+100+100")
+        if not defer_start:
+            root.geometry(f"{self.SIZE[0]}x{self.SIZE[1]}+100+100")
         root.configure(bg=self.MASK_KEY)
         root.overrideredirect(True)
         root.wm_attributes("-topmost", True)
@@ -1942,8 +2000,12 @@ class RobotFaceWindow:
         self.enable_file_drop()
 
         self.apply_theme()
-        root.update()
-        self.last_pos_x, self.last_pos_y = root.winfo_x(), root.winfo_y()
+        if not defer_start:
+            root.update()
+            self._start_ui()
+
+    def _start_ui(self):
+        self.last_pos_x, self.last_pos_y = self.root.winfo_x(), self.root.winfo_y()
         self.last_move_t = time.time()
         self.animate_loop()
         self.poll()
@@ -2456,6 +2518,10 @@ class RobotFaceWindow:
                         self.summon()
                     elif kind == "connections":
                         self.open_connections()
+                    elif kind == "connections_result":
+                        panel, status, note = item[1:]
+                        if getattr(self, "conn_win", None) is panel and panel.winfo_exists():
+                            panel._receive_result(status, note)
                     elif kind == "dev_panel":
                         self.open_dev_console() if item[1] else self.close_dev_console()
                     elif kind == "dev_out":
@@ -2467,15 +2533,24 @@ class RobotFaceWindow:
         self.root.after(150, self.poll)
 
 _SS = 4                                         # supersampling factor
-_FONT_CACHE: dict = {}
+_FONT_CACHE = OrderedDict()
 _FONT_FILES = ("segoeui.ttf", "seguisb.ttf", "arial.ttf", "DejaVuSans.ttf")
 _EMOJI_FILES = ("seguiemj.ttf",)
+
+
+def _cache_put(cache: OrderedDict, key, value, limit: int):
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > limit:
+        cache.popitem(last=False)
 
 
 def _font(px: float, emoji: bool = False):
     key = (round(px * _SS), emoji)
     f = _FONT_CACHE.get(key)
-    if f is None:
+    if f is not None:
+        _FONT_CACHE.move_to_end(key)
+    else:
         for name in (_EMOJI_FILES if emoji else _FONT_FILES):
             try:
                 f = ImageFont.truetype(name, key[0])
@@ -2487,7 +2562,7 @@ def _font(px: float, emoji: bool = False):
                 f = ImageFont.load_default(key[0])
             except Exception:
                 f = ImageFont.load_default()
-        _FONT_CACHE[key] = f
+        _cache_put(_FONT_CACHE, key, f, 64)
     return f
 
 
@@ -2601,7 +2676,8 @@ class LayeredMishWindow(RobotFaceWindow):
     GEAR_RECT = (164, 62, 184, 82)                   # shown on hover only
     FACE_CENTER = (120, 44)
     TEXT_COL, ISLAND_FONT_PX, LINE_H = (248, 250, 252), 13, 18
-    _eye_cache, _halo_cache, _status_cache, _gear_cache, _body_cache = {}, {}, {}, {}, {}
+    _eye_cache, _body_cache = {}, {}
+    _halo_cache, _status_cache, _gear_cache = OrderedDict(), OrderedDict(), OrderedDict()
     _st = None
     _notch_wide = False
 
@@ -2632,7 +2708,7 @@ class LayeredMishWindow(RobotFaceWindow):
         self._orig_wma = root.wm_attributes
         self._last_sys_check = 0.0
         root.wm_attributes = self._wma_proxy         # Tk must never touch -alpha / -transparentcolor
-        super().__init__(root, mish, ui_queue)
+        super().__init__(root, mish, ui_queue, defer_start=True)
 
         self.canvas.pack_forget()                    # the old Tk-drawn widgets are replaced by the bitmap
         self.btn_gear.place_forget()
@@ -2641,11 +2717,25 @@ class LayeredMishWindow(RobotFaceWindow):
                         ("<Motion>", self._ev_motion), ("<Map>", lambda e: self._invalidate())):
             root.bind(seq, fn, add="+")
         self.apply_theme()
-        self._invalidate()
-        self._compose()
-        self._apply()
+        self._prepare_startup_dock()
+        root.after(0, self._start_ui)
         if self.settings.get("dev", 0) == 1:
             root.after(600, self.open_dev_console)
+
+    def _prepare_startup_dock(self):
+        """Upload the first handle frame while the root is still withdrawn."""
+        self._dock_mon = _monitor_of(self.root)
+        self._mode = "handle"
+        target = self._target(self._mode)
+        self._g = {key: target[key] for key in ("w", "h", "r", "flat")}
+        self._wt = self._weights(self._mode)
+        x, y = target["x"], target["y"]
+        self.root.geometry(f"{int(target['w'])}x{int(target['h'])}+{x}+{y}")
+        self.root.update_idletasks()
+        self.render_16bit_eyes(present=False)
+        self._compose()
+        if not self._apply(x, y):
+            raise RuntimeError("Could not present Mish's docked startup frame")
 
     def _wma_proxy(self, *a, **kw):
         """Intercept the two Tk attributes that fight with UpdateLayeredWindow; everything else passes through."""
@@ -2714,14 +2804,14 @@ class LayeredMishWindow(RobotFaceWindow):
 
     def _halo(self, rgb):
         hl = self._halo_cache.get(rgb)
-        if hl is None:
+        if hl is not None:
+            self._halo_cache.move_to_end(rgb)
+        else:
             g = ImageChops.invert(Image.radial_gradient("L")).resize((HALO_W, HALO_H), Image.Resampling.BILINEAR)
             g = g.point(lambda v: int(v * v / 255 * 0.16))
             hl = Image.new("RGBA", g.size, rgb + (255,))
             hl.putalpha(g)
-            if len(self._halo_cache) > 200:
-                self._halo_cache.clear()
-            self._halo_cache[rgb] = hl
+            _cache_put(self._halo_cache, rgb, hl, 64)
         return hl
 
     def _body_sprite(self, breath):
@@ -2759,7 +2849,9 @@ class LayeredMishWindow(RobotFaceWindow):
 
     def _gear_sprite(self, rgb):
         spr = self._gear_cache.get(rgb)
-        if spr is None:
+        if spr is not None:
+            self._gear_cache.move_to_end(rgb)
+        else:
             S, N = _SS, 20
             lay = Image.new("RGBA", (N * S, N * S), (0, 0, 0, 0))
             d = ImageDraw.Draw(lay)
@@ -2767,7 +2859,8 @@ class LayeredMishWindow(RobotFaceWindow):
             d.polygon(_gear_points(c, c, 9 * S, 6.6 * S), fill=col)
             d.ellipse((c - 6.8 * S, c - 6.8 * S, c + 6.8 * S, c + 6.8 * S), fill=col)
             d.ellipse((c - 2.6 * S, c - 2.6 * S, c + 2.6 * S, c + 2.6 * S), fill=(0, 0, 0, 0))
-            spr = self._gear_cache[rgb] = lay.resize((N, N), Image.Resampling.LANCZOS)
+            spr = lay.resize((N, N), Image.Resampling.LANCZOS)
+            _cache_put(self._gear_cache, rgb, spr, 16)
         return spr
 
     def _status_sprite(self, text, rgb):
@@ -2775,6 +2868,7 @@ class LayeredMishWindow(RobotFaceWindow):
         key = (text, rgb)
         spr = self._status_cache.get(key)
         if spr is not None:
+            self._status_cache.move_to_end(key)
             return spr
         S, px = _SS, 11
         f = _font(px)
@@ -2792,9 +2886,7 @@ class LayeredMishWindow(RobotFaceWindow):
         except Exception:
             d.text((tx * S, (cy - 7) * S), text, font=f, fill=fill)
         spr = lay.resize((cw, chh), Image.Resampling.LANCZOS)
-        if len(self._status_cache) > 64:
-            self._status_cache.clear()
-        self._status_cache[key] = spr
+        _cache_put(self._status_cache, key, spr, 32)
         return spr
 
     def _mini_eyes(self, layer, cx, cy, scale):
@@ -2981,7 +3073,7 @@ class LayeredMishWindow(RobotFaceWindow):
                       mask, mask_rgb, mask_bob)
         return st
 
-    def render_16bit_eyes(self):
+    def render_16bit_eyes(self, *, present: bool = True):
         now = time.time()
         if self.settings["theme"] == "auto" and now - self._last_sys_check > 2.5:
             self._last_sys_check = now
@@ -3006,6 +3098,8 @@ class LayeredMishWindow(RobotFaceWindow):
         })
         st = self._visual_state(now, pointer, profile_mood)
         self._st = st
+        if not present:
+            return
         if self._mode == "handle" and not self._anim_on and st["hover"] != self._notch_wide:
             self._notch_wide = st["hover"]
             self._morph("handle", 0.22)
@@ -3292,11 +3386,6 @@ class LayeredMishWindow(RobotFaceWindow):
     def _invalidate(self):
         self._dirty = True
         self._last_cells = None
-
-    def _rgb(self, h: str):
-        return _hex_rgb(h)
-
-
 
     def _apply(self, x=None, y=None):
         if not self._frame_ready:
@@ -3740,22 +3829,55 @@ def ensure_single_instance() -> bool:
     return True
 
 
-def _hotkey_loop(ui_queue: queue.Queue, stop_event: threading.Event):
-    """Listen for global Alt+M via Win32 RegisterHotKey on a dedicated message thread."""
-    WM_HOTKEY, HK_ID = 0x0312, 1
-    msg = _wt.MSG()
-    if not ctypes.windll.user32.RegisterHotKey(None, HK_ID, HOTKEY_MOD, HOTKEY_VK):
-        log("hotkey: RegisterHotKey failed (Alt+M may already be bound by another app)")
-        return
-    log("hotkey: registered Alt+M")
-    try:
-        while not stop_event.is_set():
-            while ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                if msg.message == WM_HOTKEY and msg.wParam == HK_ID:
-                    ui_queue.put(("summon",))
-            stop_event.wait(0.08)
-    finally:
-        ctypes.windll.user32.UnregisterHotKey(None, HK_ID)
+class _HotkeyListener(threading.Thread):
+    """Own the Win32 message queue for the global Alt+M registration."""
+
+    WM_HOTKEY, WM_QUIT, HK_ID = 0x0312, 0x0012, 1
+
+    def __init__(self, ui_queue: queue.Queue):
+        super().__init__(name="mish-hotkey", target=self._hotkey_loop, daemon=True)
+        self._ui = ui_queue
+        self._lock = threading.Lock()
+        self._stopping = False
+        self._thread_id = None
+
+    def stop(self):
+        with self._lock:
+            self._stopping = True
+            if self._thread_id is None:
+                return
+            if _U32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0):
+                self._thread_id = None
+                return
+            error = ctypes.get_last_error()
+        log("hotkey: PostThreadMessageW failed:", error)
+
+    def _hotkey_loop(self):
+        msg = _wt.MSG()
+        if not _U32.RegisterHotKey(None, self.HK_ID, HOTKEY_MOD, HOTKEY_VK):
+            log("hotkey: RegisterHotKey failed (Alt+M may already be bound by another app)")
+            return
+        try:
+            # Create the queue before publishing the thread ID to the shutdown path.
+            _U32.PeekMessageW(ctypes.byref(msg), None, 0x0400, 0x0400, 0)
+            with self._lock:
+                if self._stopping:
+                    return
+                self._thread_id = _wt.DWORD(ctypes.windll.kernel32.GetCurrentThreadId())
+            log("hotkey: registered Alt+M")
+            while True:
+                result = _U32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result == -1:
+                    log("hotkey: GetMessageW failed:", ctypes.get_last_error())
+                    return
+                if result == 0:
+                    return
+                if msg.message == self.WM_HOTKEY and msg.wParam == self.HK_ID:
+                    self._ui.put(("summon",))
+        finally:
+            with self._lock:
+                self._thread_id = None
+            _U32.UnregisterHotKey(None, self.HK_ID)
 
 
 def ensure_portable_setup(base_dir: Path):
@@ -3799,13 +3921,18 @@ def main():
 
 
 def _run_app():
-    ensure_portable_setup(user_data_dir())
+    try:
+        ensure_portable_setup(user_data_dir())
+    except OSError as error:
+        log("portable setup failed:", repr(error))
     ui_queue: queue.Queue = queue.Queue()
     mish = Mish(ui_queue)
+    hotkey = _HotkeyListener(ui_queue)
     icon = None
 
 
     def quit_app(icon=None, _item=None):
+        hotkey.stop()
         mish.shutdown()
         if icon is not None:
             try:
@@ -3816,8 +3943,12 @@ def _run_app():
 
     try:
         root = tk.Tk()
+        root.withdraw()
         LayeredMishWindow(root, mish, ui_queue)
+        root.deiconify()
         root.protocol("WM_DELETE_WINDOW", quit_app)
+
+        import pystray
 
         icon = pystray.Icon(
             "Mish", create_icon_image(), "Mish",
@@ -3833,11 +3964,14 @@ def _run_app():
         )
 
         for target in (mish.watcher_loop, mish.scheduler_loop, mish.timer_loop, mish.observe_loop, mish.pester_loop,
-                       mish.hardware_loop, mish.startup_briefing):
+                       mish.hardware_loop):
             threading.Thread(target=target, daemon=True).start()
-        threading.Thread(target=_hotkey_loop, args=(ui_queue, mish.stop_event), daemon=True).start()
+        hotkey.start()
         threading.Thread(target=icon.run, daemon=True).start()
+        root.after_idle(lambda: threading.Thread(target=mish.startup_briefing, daemon=True).start())
 
         root.mainloop()
     finally:
         quit_app(icon)
+        if hotkey.ident is not None:
+            hotkey.join(timeout=1.0)

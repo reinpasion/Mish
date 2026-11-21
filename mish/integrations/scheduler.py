@@ -6,9 +6,6 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from apscheduler.schedulers.background import BackgroundScheduler
-
 from ..config import user_data_dir
 from ..win_utils import idle_seconds, log
 from .blackboard import BlackboardSync
@@ -51,13 +48,11 @@ class AutomationHub:
         self.google = GoogleSync(self.base_dir)
         self.ms = MicrosoftSync(self.cfg.get("microsoft_client_id", ""), self.base_dir)
 
-        db_url = f"sqlite:///{(self.base_dir / 'mish_jobs.sqlite').as_posix()}"
-        self.sched = BackgroundScheduler(
-            jobstores={"default": SQLAlchemyJobStore(url=db_url)},
-            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
-        )
+        self.sched = None
         self._started = False
         self._failsafe_fired_date = ""
+        self._ms_action_lock = threading.Lock()
+        self._ms_action_pending = False
 
     def _load_config(self) -> dict:
         if not self.cfg_path.exists():
@@ -104,17 +99,15 @@ class AutomationHub:
             log("hub: open_config_file failed:", repr(e))
 
     def status(self) -> dict:
-        """Return live connection states for the Ghost HUD Connections panel."""
-        g_creds = self.google._get_creds(interactive=False)
-        ms_tok = self.ms._token(interactive=False)
+        """Describe locally saved sign-ins without invoking either auth client."""
         return {
             "bb_url": self.bb.ics_url,
             "bb_connected": bool(self.bb.ics_url),
             "bb_count": len(self.bb._seen),
             "google_has_creds": self.google.creds_file.exists(),
-            "google_connected": bool(g_creds and g_creds.valid),
+            "google_connected": self.google.token_file.is_file(),
             "ms_client_id": self.ms.client_id,
-            "ms_connected": bool(ms_tok),
+            "ms_connected": bool(self.ms.client_id and self.ms.cache_file.is_file()),
         }
 
     def install_google_creds(self, src_path: str) -> tuple[bool, str]:
@@ -128,21 +121,22 @@ class AutomationHub:
             return False, f"Invalid JSON: {e}"
 
     def disconnect_google(self):
-        if self.google.token_file.exists():
-            self.google.token_file.unlink()
+        self.google.disconnect()
 
     def disconnect_microsoft(self):
-        if self.ms.cache_file.exists():
-            self.ms.cache_file.unlink()
-        self.ms.cache = __import__("msal").SerializableTokenCache()
-        self.ms.configure(self.ms.client_id)
+        self.ms.disconnect()
 
     def start(self):
         if self._started:
             return
-        global _ACTIVE_HUB
-        _ACTIVE_HUB = self
-        self._started = True
+        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+        from apscheduler.schedulers.background import BackgroundScheduler
+
+        db_url = f"sqlite:///{(self.base_dir / 'mish_jobs.sqlite').as_posix()}"
+        self.sched = BackgroundScheduler(
+            jobstores={"default": SQLAlchemyJobStore(url=db_url)},
+            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
+        )
 
         self.sched.add_job(_job_sync_deadlines, "interval", minutes=15, id="sync_deadlines", replace_existing=True)
         self.sched.add_job(_job_poll_alerts, "interval", minutes=5, id="poll_alerts", replace_existing=True)
@@ -158,18 +152,28 @@ class AutomationHub:
                 **item["cron"],
             )
 
-        self.sched.start()
-        self.sched.add_job(_job_sync_deadlines, "date", run_date=datetime.now().astimezone())
+        global _ACTIVE_HUB
+        _ACTIVE_HUB = self
+        try:
+            self.sched.start()
+            self._started = True
+            self.sched.add_job(_job_sync_deadlines, "date", run_date=datetime.now().astimezone())
+        except Exception:
+            self.shutdown()
+            raise
 
     def shutdown(self):
         global _ACTIVE_HUB
         try:
-            if self._started:
+            if self.sched is not None and self.sched.running:
                 self.sched.shutdown(wait=False)
+                # The scheduler thread has joined. Dispose any SQLite connection opened on its final wake.
+                self.sched.remove_jobstore("default")
         except Exception:
             pass
         if _ACTIVE_HUB is self:
             _ACTIVE_HUB = None
+        self._started = False
 
     def sync_now_async(self, announce_empty: bool = True):
         def work():
@@ -189,13 +193,45 @@ class AutomationHub:
                 self.sync_all_deadlines()
         threading.Thread(target=work, daemon=True).start()
 
-    def connect_microsoft_async(self):
+    def _start_ms_action(self, action) -> bool:
+        with self._ms_action_lock:
+            if self._ms_action_pending:
+                return False
+            self._ms_action_pending = True
+
+        def run():
+            try:
+                action()
+            except Exception as error:
+                log("hub: Microsoft account action failed:", repr(error))
+                self.ui.put(("say", "Microsoft account action failed.", "sad"))
+            finally:
+                with self._ms_action_lock:
+                    self._ms_action_pending = False
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except Exception:
+            with self._ms_action_lock:
+                self._ms_action_pending = False
+            raise
+        return True
+
+    def connect_microsoft_async(self, client_id: str | None = None) -> bool:
         def work():
+            if client_id is not None:
+                self.set_ms_client_id(client_id)
             ok, msg = self.ms.authorize_interactive()
             self.ui.put(("say", msg, "happy" if ok else "sad"))
             if ok:
                 self.sync_all_deadlines()
-        threading.Thread(target=work, daemon=True).start()
+        return self._start_ms_action(work)
+
+    def disconnect_microsoft_async(self) -> bool:
+        def work():
+            self.disconnect_microsoft()
+            self.ui.put(("say", "Microsoft disconnected.", "neutral"))
+        return self._start_ms_action(work)
 
     def sync_all_deadlines(self, silent: bool = False) -> list[str]:
         added: list[str] = []

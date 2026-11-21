@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
-
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+from typing import TYPE_CHECKING
 
 from ..config import user_data_dir
 from ..win_utils import log
+
+if TYPE_CHECKING:
+    from google.oauth2.credentials import Credentials
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
@@ -26,6 +26,8 @@ class GoogleSync:
         self.base_dir = base_dir or user_data_dir()
         self.creds_file = self.base_dir / "credentials.json"
         self.token_file = self.base_dir / "google_token.json"
+        self._auth_lock = threading.Lock()
+        self._auth_gen = 0
         self.state_file = self.base_dir / "google_synced.json"
         self._state = self._load_state()
 
@@ -43,23 +45,59 @@ class GoogleSync:
         except Exception as e:
             log("google: state save failed:", repr(e))
 
+    def disconnect(self):
+        with self._auth_lock:
+            self._auth_gen += 1
+            self.token_file.unlink(missing_ok=True)
+
+    def _persist_token(self, creds: Credentials, gen: int) -> bool:
+        payload = creds.to_json()
+        with self._auth_lock:
+            if self._auth_gen != gen:
+                return False
+            self.token_file.write_text(payload, encoding="utf-8")
+            return True
+
     def _get_creds(self, interactive: bool = False) -> Credentials | None:
+        with self._auth_lock:
+            gen = self._auth_gen
+            try:
+                saved = self.token_file.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                saved = None
         creds = None
-        if self.token_file.exists():
-            creds = Credentials.from_authorized_user_file(str(self.token_file), SCOPES)
+        if saved is not None:
+            try:
+                from google.oauth2.credentials import Credentials
+            except ImportError as error:
+                log("google: credentials library unavailable:", repr(error))
+                return None
+            creds = Credentials.from_authorized_user_info(json.loads(saved), SCOPES)
         if creds and creds.expired and creds.refresh_token:
             try:
+                from google.auth.transport.requests import Request
+
                 creds.refresh(Request())
-                self.token_file.write_text(creds.to_json(), encoding="utf-8")
+                if not self._persist_token(creds, gen):
+                    return None
             except Exception as e:
+                with self._auth_lock:
+                    if self._auth_gen != gen:
+                        return None
                 log("google: token refresh failed:", repr(e))
                 creds = None
+        with self._auth_lock:
+            if self._auth_gen != gen:
+                return None
         if not creds or not creds.valid:
             if not interactive or not self.creds_file.exists():
                 return None
+            from google_auth_oauthlib.flow import InstalledAppFlow
+
             flow = InstalledAppFlow.from_client_secrets_file(str(self.creds_file), SCOPES)
             creds = flow.run_local_server(port=0)
-            self.token_file.write_text(creds.to_json(), encoding="utf-8")
+            if not self._persist_token(creds, gen):
+                return None
         return creds
 
     def authorize_interactive(self) -> tuple[bool, str]:
@@ -77,6 +115,8 @@ class GoogleSync:
         if not creds:
             return []
         try:
+            from googleapiclient.discovery import build
+
             cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
             now = datetime.now(timezone.utc)
             res = cal.events().list(
@@ -111,8 +151,6 @@ class GoogleSync:
 
             title = f"[GCal] {summary}"
             task = store.add_task(title, due_dt)
-            title = f"[GCal] {summary}"
-            task = store.add_task(title, due_ts)
             seen[ev_id] = task["id"] if task else "existing"
             if task:
                 added.append(title)
@@ -125,6 +163,8 @@ class GoogleSync:
         if not creds:
             return
         try:
+            from googleapiclient.discovery import build
+
             cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
             now = datetime.now(timezone.utc)
             res = cal.events().list(
@@ -156,6 +196,8 @@ class GoogleSync:
         if not creds or not query:
             return
         try:
+            from googleapiclient.discovery import build
+
             gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
             msgs = gmail.users().messages().list(userId="me", q=query, maxResults=5).execute().get("messages", [])
             seen = self._state.setdefault("notified_msgs", [])
@@ -181,6 +223,8 @@ class GoogleSync:
         if not creds:
             return False
         try:
+            from googleapiclient.discovery import build
+
             gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
             msg = EmailMessage()
             msg["To"] = to_addr
