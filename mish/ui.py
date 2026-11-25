@@ -46,6 +46,7 @@ from .win_utils import (
     parse_when,
 )
 from .brain import EYE_PRESETS, Mish
+from . import voice
 
 # ---- easing curves: t runs 0 -> 1 ----------------------------------------------------
 def ease_in_cubic(t: float) -> float:
@@ -138,6 +139,7 @@ class DynamicSpeechBubble(tk.Toplevel):
         self.configure(bg="#000000")
         self._parent, self._closing, self._phase = parent, False, "in"
         self._k, self._k0 = 0.0, 1.0
+        self._fade_after = self._expire_after = None
         self._x = self._y = 0
         self._above = True
         self._th = theme or get_theme("auto")
@@ -153,13 +155,14 @@ class DynamicSpeechBubble(tk.Toplevel):
         self.update_idletasks()
         self._sf.attach(self)
         self._sf.upload(self._img)
+        self.bind("<Button-1>", lambda e: self._close())
+        # Present the prepared surface at zero opacity before mapping the window.
         self._present()
         self.deiconify()
         self.update_idletasks()
         self._t0 = time.perf_counter()
-        self.bind("<Button-1>", lambda e: self._close())
-        self._step()
-        self.after(duration, self._close)
+        self._fade_after = self.after(14, self._step)
+        self._expire_after = self.after(duration, self._close)
 
     def _render(self, text):
         """Theme-adaptive 14px card (soft drop shadow + 1px hairline) drawn with true per-pixel alpha."""
@@ -231,6 +234,7 @@ class DynamicSpeechBubble(tk.Toplevel):
         self._sf.present(self._x, self._y + off, self.ALPHA * self._k)
 
     def _step(self):
+        self._fade_after = None
         try:
             if not self.winfo_exists() or self._phase == "hold":
                 return
@@ -239,7 +243,7 @@ class DynamicSpeechBubble(tk.Toplevel):
             self._k = e if self._phase == "in" else self._k0 * (1.0 - e)
             self._present()
             if e < 1.0:
-                self.after(14, self._step)
+                self._fade_after = self.after(14, self._step)
             elif self._phase == "out":
                 self.destroy()
             else:
@@ -253,11 +257,18 @@ class DynamicSpeechBubble(tk.Toplevel):
                 return
         except tk.TclError:
             return
+        if self._fade_after is not None:
+            self.after_cancel(self._fade_after)
+            self._fade_after = None
         self._closing, self._phase, self._k0 = True, "out", self._k
         self._t0 = time.perf_counter()
         self._step()
 
     def destroy(self):
+        for callback in (self._fade_after, self._expire_after):
+            if callback is not None:
+                self.after_cancel(callback)
+        self._fade_after = self._expire_after = None
         try:
             self._sf.free()
         except Exception:
@@ -2265,6 +2276,7 @@ class RobotFaceWindow:
         self.eyes.set_expression(pick_expression(text, hint), dur / 1000.0 * 0.9)
         self.eyes.start_talking(len(text))
         self.show_speech_bubble(text, dur)
+        voice.speak(text)
 
     def open_chat_dialog(self):
         existing = getattr(self, "_chat_dlg", None)
@@ -2498,6 +2510,8 @@ class RobotFaceWindow:
                 try:
                     if kind == "say":
                         self.speak(item[1], item[2] if len(item) > 2 else None)
+                    elif kind == "chat_done":
+                        item[1]()
                     elif kind == "errand_start":
                         self.start_errand(item[1])
                     elif kind == "errand_done":
@@ -2697,6 +2711,8 @@ class LayeredMishWindow(RobotFaceWindow):
         self._anim_tok = 0
         self._anim_on = False
         self._dock_mon = None
+        self._summoned_chat: dict[str, int] | None = None
+        self._speech_revision = 0
         self._float_target = (100, 100)
         self._isl = None                             # island layout dict while a message is showing
         self._isl_after = None
@@ -3319,6 +3335,7 @@ class LayeredMishWindow(RobotFaceWindow):
                 return
             self.moved = True
             if self._mode == "float":
+                self._summoned_chat = None
                 self.is_held = True
         if self._mode == "float":
             nx, ny = p["wx"] + event.x_root - p["x"], p["wy"] + event.y_root - p["y"]
@@ -3487,19 +3504,69 @@ class LayeredMishWindow(RobotFaceWindow):
         self._morph("handle", 0.34)
 
     def summon(self):
-        """Global hotkey summon: pop out if tucked, bring to front, and open quick chat."""
+        """Open hotkey chat after any docked pop-out has settled."""
         self.root.deiconify()
         self.root.lift()
-        if self.docked():
-            self.pop_out(immediate=True)
-        self.root.after(40, self.open_chat_dialog)
+        session = self._summoned_chat
+        start_docked = self.docked() and session is None
+        if start_docked:
+            session = self._summoned_chat = {"opening": 0, "pending": 0, "pop_started": 0}
+            self.root.after(150, self._restore_summoned_dock, session)
+        if session is None:
+            self.root.after(40, self.open_chat_dialog)
+            return
 
-    def pop_out(self, immediate: bool = False):
+        session["opening"] += 1
+
+        def open_when_settled():
+            if self._anim_on:
+                self.root.after(12, open_when_settled)
+                return
+            if self._summoned_chat is session and self.docked() and not session["pop_started"]:
+                session["pop_started"] = 1
+                self.pop_out(preserve_chat=True)
+                self.root.after(12, open_when_settled)
+                return
+            session["opening"] -= 1
+            self.open_chat_dialog()
+
+        if start_docked:
+            open_when_settled()
+        else:
+            self.root.after(40, open_when_settled)
+
+    def _restore_summoned_dock(self, session: dict[str, int]):
+        if self._summoned_chat is not session:
+            return
+        island_visible = self._mode == "island" and self._isl is not None and self._isl_after is not None
+        if (session["opening"] or session["pending"] or self.is_listening or self.mish.thinking
+                or self.errand or self._anim_on or island_visible):
+            self.root.after(150, self._restore_summoned_dock, session)
+            return
+
+        bubble = self.active_bubble
+        if bubble is not None and bubble.winfo_exists():
+            def on_close(event):
+                if event.widget is bubble:
+                    # A new bubble can destroy this one as it is being constructed.
+                    self.root.after(0, self._restore_summoned_dock, session)
+
+            bubble.bind("<Destroy>", on_close, add="+")
+            return
+        self._summoned_chat = None
+        if not self.docked():
+            self.tuck_to_top()
+
+    def pop_out(self, immediate: bool = False, *, preserve_chat: bool = False):
+        if not immediate and not preserve_chat:            # click or pull out of the dock
+            self._summoned_chat = None
         if self._mode == "float":
             return
         l, t, r, _b = self._monitor_rect()
-        remaining = (self._isl_end - time.time()) * 1000 if self._isl else 0
-        text = self._isl["text"] if self._isl else None
+        island = self._isl if self._mode == "island" and self._isl_after is not None else None
+        expires = self._isl_end
+        is_timer = self._bubble_is_timer
+        revision = self._speech_revision
         self._cancel_island_timer()
         self._float_target = ((l + r) // 2 - self.SIZE[0] // 2, t + 36)
         self.eyes.set_expression("happy", 1.4)
@@ -3508,9 +3575,19 @@ class LayeredMishWindow(RobotFaceWindow):
             self._dock_mon = None
             self._isl = None
             self._invalidate()
-            if text and remaining > 900:                             # carry the unfinished message into a normal bubble
-                bubble_text = text
-                self.root.after(60, lambda: RobotFaceWindow.show_speech_bubble(self, bubble_text, int(remaining)))
+            if island is None or expires - time.time() <= 0.9:
+                return
+            transition = self._anim_tok
+
+            def carry_message():
+                if (self._mode != "float" or self._anim_tok != transition
+                        or self._speech_revision != revision):
+                    return
+                remaining = int((expires - time.time()) * 1000)
+                if remaining > 0:
+                    self.show_speech_bubble(island["text"], remaining, timer=is_timer)
+
+            self.root.after(60, carry_message)
         if immediate:
             self._anim_tok += 1
             self._anim_on = False
@@ -3536,10 +3613,12 @@ class LayeredMishWindow(RobotFaceWindow):
             self._isl_after = None
 
     def show_speech_bubble(self, text: str, duration: int | None = None, timer: bool = False):
-        if not self.docked():
-            return super().show_speech_bubble(text, duration, timer)
-        if timer and time.time() < self._timer_mute_until:
+        docked = self.docked()
+        if docked and timer and time.time() < self._timer_mute_until:
             return
+        self._speech_revision += 1
+        if not docked:
+            return super().show_speech_bubble(text, duration, timer)
         self._bubble_is_timer = timer
         dur = duration or speech_duration_ms(text)
         new = self._layout_island(text)
@@ -3710,8 +3789,23 @@ class LayeredMishWindow(RobotFaceWindow):
         def send(_e=None):
             txt = var.get().strip()
             close()
-            if txt:
-                threading.Thread(target=self.mish.handle_user_input, args=(txt,), daemon=True).start()
+            if not txt:
+                return
+            session = self._summoned_chat
+
+            def complete():
+                session["pending"] -= 1
+
+            if session is not None:
+                session["pending"] += 1
+            try:
+                threading.Thread(target=self.mish.handle_user_input, args=(txt,),
+                                 kwargs={"on_complete": complete if session is not None else None},
+                                 daemon=True).start()
+            except RuntimeError:
+                if session is not None:
+                    complete()
+                raise
 
         def open_tasks(_e=None):
             close()
@@ -3932,6 +4026,7 @@ def _run_app():
 
 
     def quit_app(icon=None, _item=None):
+        voice.stop()
         hotkey.stop()
         mish.shutdown()
         if icon is not None:

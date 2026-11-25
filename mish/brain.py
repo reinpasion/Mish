@@ -456,6 +456,7 @@ class Mish:
     # ---- setup ------------------------------------------------------------------
     def __init__(self, ui_queue: queue.Queue):
         self.ui = ui_queue
+        self._chat_reply = threading.local()
         self.store = Store(DATA_DIR / "memory.json")
         self.settings = Settings(DATA_DIR / "settings.json")
         self.stop_event = threading.Event()
@@ -1462,7 +1463,7 @@ class Mish:
                 self.say(line, expr=hint)
             else:                                            # brain down or sulking: the checked facts still help
                 self.say(facts[:1].upper() + facts[1:], expr=hint)
-        threading.Thread(target=work, daemon=True).start()
+        self._run_reply_work(work)
 
     def sys_text(self) -> str:
         cpu = psutil.cpu_percent(interval=0.4)
@@ -1623,14 +1624,11 @@ class Mish:
         if len(parts) < 4:
             return "Usage: !mail gmail|microsoft | to@email.com | Subject | Message body"
         provider, to_addr, subj, body = parts[0], parts[1], parts[2], "|".join(parts[3:])
-        threading.Thread(
-            target=lambda: self.say(
-                f"Sent email to {to_addr}." if self.hub.send_email_now(provider, to_addr, subj, body)
-                else f"Failed to send via {provider} — check credentials.",
-                expr="happy",
-            ),
-            daemon=True,
-        ).start()
+        def work():
+            self.say(f"Sent email to {to_addr}." if self.hub.send_email_now(provider, to_addr, subj, body)
+                     else f"Failed to send via {provider} — check credentials.", expr="happy")
+
+        self._run_reply_work(work)
         return ""
 
     def _bang_profile(self, arg: str) -> str:
@@ -1919,14 +1917,27 @@ class Mish:
         finally:
             self._shutdown_done.set()
 
-    def handle_user_input(self, text: str):
-        """Everything typed into his chat box. Runs on a worker thread."""
-        with self.busy():                                    # thinking eyes while he works
-            try:
-                self._route_input(text)
-            except Exception as e:
-                log("handle_user_input error:", repr(e))
-                self.say("My brain hiccuped on that one. Try saying it differently?", expr="sad")
+    def _run_reply_work(self, work):
+        """A tracked chat already runs on a worker, so include deferred replies in its lifetime."""
+        if getattr(self._chat_reply, "tracked", False):
+            work()
+        else:
+            threading.Thread(target=work, daemon=True).start()
+
+    def handle_user_input(self, text: str, *, on_complete=None):
+        """Run chat on a worker and queue its optional completion callback for the UI."""
+        self._chat_reply.tracked = on_complete is not None
+        try:
+            with self.busy():                                # thinking eyes while he works
+                try:
+                    self._route_input(text)
+                except Exception as e:
+                    log("handle_user_input error:", repr(e))
+                    self.say("My brain hiccuped on that one. Try saying it differently?", expr="sad")
+        finally:
+            self._chat_reply.tracked = False
+            if on_complete is not None:
+                self.ui.put(("chat_done", on_complete))
 
     def _route_input(self, text: str):
         if text.lstrip().startswith("!"):                    # utility commands work even while he is on strike
