@@ -27,14 +27,40 @@ def _keywords(text: str) -> set[str]:
     return {word for word in _WORD.findall(text.casefold()) if len(word) >= 3 and word not in _STOP_WORDS}
 
 
+def match_task_reference(reference: str, tasks: list[dict], *, in_context: bool = False) -> list[dict]:
+    """Find unambiguous titles or return all candidates for a short, shared reference."""
+    def normalize(text):
+        return " ".join(_WORD.findall(text.casefold()))
+
+    query = normalize(reference)
+    if not query:
+        return []
+
+    titles = []
+    for task in tasks:
+        title = re.sub(r"^\[[^]]+\]\s*", "", task["text"])
+        normalized = normalize(title)
+        if normalized:
+            titles.append((task, normalized))
+    if in_context:
+        return [task for task, title in titles if f" {title} " in f" {query} "]
+
+    exact = [task for task, title in titles if title == query]
+    if exact:
+        return exact
+    words = _keywords(query)
+    return [task for task, title in titles
+            if f" {query} " in f" {title} " or (words and words <= _keywords(title))]
+
+
 def task_source(task: dict) -> str:
     source = str(task.get("source") or "").strip()
-    if not source:
-        text = task["text"]
-        if text.startswith("[") and "]" in text:
-            source = text[1:text.index("]")]
-        return _SOURCES.get(source.casefold(), "")
-    return _SOURCES.get(source.casefold(), source)
+    text = task["text"].lstrip()
+    prefix = text[1:text.index("]")] if text.startswith("[") and "]" in text else ""
+    tagged_source = _SOURCES.get(prefix.strip().casefold(), "")
+    if tagged_source == "Blackboard":
+        return tagged_source
+    return _SOURCES.get(source.casefold(), source) if source else tagged_source
 
 
 def task_due(task: dict) -> datetime | None:
@@ -45,8 +71,12 @@ def task_due(task: dict) -> datetime | None:
         return None
 
 
-def _due_order(task: dict) -> tuple[datetime, int]:
-    return task_due(task) or datetime.max, task.get("id", 0)
+def _task_order(task: dict) -> tuple[bool, float, int]:
+    try:
+        due = datetime.fromisoformat(task.get("due")).timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        due = float("inf")
+    return task_source(task) != "Blackboard", due, task.get("id", 0)
 
 
 class Store(_PersistentStore):
@@ -80,10 +110,17 @@ class Store(_PersistentStore):
         matches.sort(reverse=True)
         return [{"text": text, "strength": strength} for _, strength, _, text in matches[:limit]]
 
+    def pending(self) -> list[dict]:
+        """Return ranked live task objects for commands and sync updates."""
+        with self.lock:
+            tasks = [(task, task.copy()) for task in self.data["tasks"] if not task["done"]]
+        tasks.sort(key=lambda item: _task_order(item[1]))
+        return [task for task, _ in tasks]
+
     def pending_snapshot(self) -> list[dict]:
         with self.lock:
             tasks = [task.copy() for task in self.data["tasks"] if not task["done"]]
-        return sorted(tasks, key=_due_order)
+        return sorted(tasks, key=_task_order)
 
     def relevant_tasks(self, query: str, limit: int = 3) -> list[dict]:
         if limit <= 0:
@@ -93,10 +130,10 @@ class Store(_PersistentStore):
         if len(pending) <= 1 or not words or limit == 1:
             return pending[:1]
 
-        matches = []
+        selected = pending[:1]
         for task in pending[1:]:
-            overlap = len(words & _keywords(f"{task['text']} {task_source(task)}"))
-            if overlap:
-                matches.append((overlap, task))
-        matches.sort(key=lambda pair: pair[0], reverse=True)
-        return [pending[0], *(task for _, task in matches[:limit - 1])]
+            if words & _keywords(f"{task['text']} {task_source(task)}"):
+                selected.append(task)
+                if len(selected) == limit:
+                    break
+        return selected

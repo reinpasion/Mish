@@ -99,15 +99,35 @@ class AutomationHub:
             log("hub: open_config_file failed:", repr(e))
 
     def status(self) -> dict:
-        """Describe locally saved sign-ins without invoking either auth client."""
+        """Inspect saved credentials without invoking either auth client."""
+        google_connected = False
+        try:
+            token = json.loads(self.google.token_file.read_text(encoding="utf-8"))
+            google_connected = bool(token.get("refresh_token") or token.get("token"))
+        except (AttributeError, OSError, ValueError):
+            pass
+
+        client_id = self.ms.client_id
+        microsoft_connected = False
+        if client_id:
+            try:
+                cache = json.loads(self.ms.cache_file.read_text(encoding="utf-8"))
+                tokens = cache.get("RefreshToken", {})
+                microsoft_connected = any(
+                    isinstance(token, dict) and token.get("secret")
+                    for token in tokens.values()
+                )
+            except (AttributeError, OSError, ValueError):
+                pass
+
         return {
             "bb_url": self.bb.ics_url,
             "bb_connected": bool(self.bb.ics_url),
             "bb_count": len(self.bb._seen),
             "google_has_creds": self.google.creds_file.exists(),
-            "google_connected": self.google.token_file.is_file(),
-            "ms_client_id": self.ms.client_id,
-            "ms_connected": bool(self.ms.client_id and self.ms.cache_file.is_file()),
+            "google_connected": google_connected,
+            "ms_client_id": client_id,
+            "ms_connected": microsoft_connected,
         }
 
     def install_google_creds(self, src_path: str) -> tuple[bool, str]:

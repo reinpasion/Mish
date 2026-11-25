@@ -139,7 +139,7 @@ class DynamicSpeechBubble(tk.Toplevel):
         self.configure(bg="#000000")
         self._parent, self._closing, self._phase = parent, False, "in"
         self._k, self._k0 = 0.0, 1.0
-        self._fade_after = self._expire_after = None
+        self._step_job = self._expire_after = None
         self._x = self._y = 0
         self._above = True
         self._th = theme or get_theme("auto")
@@ -161,11 +161,13 @@ class DynamicSpeechBubble(tk.Toplevel):
         self.deiconify()
         self.update_idletasks()
         self._t0 = time.perf_counter()
-        self._fade_after = self.after(14, self._step)
+        self._step_job = self.after(14, self._step)
         self._expire_after = self.after(duration, self._close)
 
     def _render(self, text):
-        """Theme-adaptive 14px card (soft drop shadow + 1px hairline) drawn with true per-pixel alpha."""
+        """Theme-adaptive 14px card (soft drop shadow + 1px hairline) with true per-pixel alpha.
+        The shadow is blurred at 1x (a 5px blur is resolution-independent); only the card edge and text are
+        supersampled, reducing the work needed to prepare a bubble."""
         S, F, px, th = _SS, self.FEATHER, self.FONT_PX, self._th
         lines = _wrap(text, px, self.WRAP, self.MAX_LINES) or [""]
         head, hpx = "MISH", 8.5
@@ -174,19 +176,18 @@ class DynamicSpeechBubble(tk.Toplevel):
         inner_h = 16 + len(lines) * self.LINE_H
         padx, pady = 15, 11
         w, h = inner_w + 2 * (F + padx), inner_h + 2 * (F + pady)
-        box = (F * S, F * S, (w - F) * S - 1, (h - F) * S - 1)
-        size = (w * S, h * S)
 
-        sh = Image.new("L", size, 0)                              # soft drop shadow, 3px down
-        ImageDraw.Draw(sh).rounded_rectangle((box[0], box[1] + 3 * S, box[2], box[3] + 3 * S), radius=14 * S, fill=255)
-        sh = sh.filter(ImageFilter.GaussianBlur(5 * S)).point(lambda v: int(v * (0.20 if th["is_light"] else 0.45)))
-        shadow = Image.new("RGBA", size, (0, 0, 0, 255))
+        sh = Image.new("L", (w, h), 0)                            # soft drop shadow, 3px down, at 1x
+        ImageDraw.Draw(sh).rounded_rectangle((F, F + 3, w - F - 1, h - F + 2), radius=14, fill=255)
+        sh = sh.filter(ImageFilter.GaussianBlur(5)).point(lambda v: int(v * (0.20 if th["is_light"] else 0.45)))
+        shadow = Image.new("RGBA", (w, h), (0, 0, 0, 255))
         shadow.putalpha(sh)
-        card = Image.new("RGBA", size, (0, 0, 0, 0))
-        ImageDraw.Draw(card).rounded_rectangle(box, radius=14 * S, fill=_hex_rgb(th["bg"]) + (244,),
-                                               outline=_hex_rgb(th["line"]) + (255,), width=S)
-        out = Image.alpha_composite(shadow, card)
-        d = ImageDraw.Draw(out)
+
+        box = (F * S, F * S, (w - F) * S - 1, (h - F) * S - 1)
+        card = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(card)
+        d.rounded_rectangle(box, radius=14 * S, fill=_hex_rgb(th["bg"]) + (244,),
+                            outline=_hex_rgb(th["line"]) + (255,), width=S)
         x, y = (F + padx), (F + pady)
         for ch in head:
             d.text((x * S, y * S), ch, font=_font(hpx), fill=self._accent + (235,))
@@ -204,7 +205,7 @@ class DynamicSpeechBubble(tk.Toplevel):
                 except Exception:
                     pass
                 x += f.getlength(run) / S
-        return out.resize((w, h), Image.Resampling.LANCZOS)
+        return Image.alpha_composite(shadow, card.resize((w, h), Image.Resampling.LANCZOS))
 
     def _place_near(self):
         p, F = self._parent, self.FEATHER
@@ -234,7 +235,7 @@ class DynamicSpeechBubble(tk.Toplevel):
         self._sf.present(self._x, self._y + off, self.ALPHA * self._k)
 
     def _step(self):
-        self._fade_after = None
+        self._step_job = None
         try:
             if not self.winfo_exists() or self._phase == "hold":
                 return
@@ -243,7 +244,7 @@ class DynamicSpeechBubble(tk.Toplevel):
             self._k = e if self._phase == "in" else self._k0 * (1.0 - e)
             self._present()
             if e < 1.0:
-                self._fade_after = self.after(14, self._step)
+                self._step_job = self.after(14, self._step)
             elif self._phase == "out":
                 self.destroy()
             else:
@@ -257,18 +258,21 @@ class DynamicSpeechBubble(tk.Toplevel):
                 return
         except tk.TclError:
             return
-        if self._fade_after is not None:
-            self.after_cancel(self._fade_after)
-            self._fade_after = None
+        if self._step_job is not None:
+            try:
+                self.after_cancel(self._step_job)
+            except tk.TclError:
+                pass
+            self._step_job = None
         self._closing, self._phase, self._k0 = True, "out", self._k
         self._t0 = time.perf_counter()
         self._step()
 
     def destroy(self):
-        for callback in (self._fade_after, self._expire_after):
+        for callback in (self._step_job, self._expire_after):
             if callback is not None:
                 self.after_cancel(callback)
-        self._fade_after = self._expire_after = None
+        self._step_job = self._expire_after = None
         try:
             self._sf.free()
         except Exception:
@@ -1951,6 +1955,7 @@ class RobotFaceWindow:
     RADIUS = 24
     FACE_CENTER = (108, 48)    # between the eyes, inside the window (for mouse-following)
     SIZE = (240, 130)
+    FRAME_MS = 33
 
     def __init__(self, root: tk.Tk, mish: Mish, ui_queue: queue.Queue, *, defer_start: bool = False):
         self.root, self.mish, self.ui = root, mish, ui_queue
@@ -2453,12 +2458,14 @@ class RobotFaceWindow:
         self.mish.react_async("strike_start")
 
     def animate_loop(self):
+        started = time.perf_counter()
         try:
             self.update_physics()
             self.render_16bit_eyes()
         except Exception as e:
             log("animate_loop error:", repr(e))
-        self.root.after(35, self.animate_loop)
+        spent_ms = (time.perf_counter() - started) * 1000
+        self.root.after(max(1, int(self.FRAME_MS - spent_ms)), self.animate_loop)
 
     # ---- mouse -----------------------------------------------------------------------------
     def on_press(self, event):
@@ -2683,6 +2690,7 @@ class LayeredMishWindow(RobotFaceWindow):
     HANDLE, HANDLE_WIDE = (150, 22), (212, 28)       # notch: resting / hovered
     HANDLE_EYE_SCALE, ISLAND_EYE_SCALE = 0.33, 0.38
     SLEEP_MASK_SIZE = (116, 40)
+    MORPH_FRAME_MS, MORPH_SS = 16, 2
     ISLAND_W, ISLAND_MIN_H, ISLAND_MAX_LINES = 368, 56, 6
     ISLAND_Y, DOCK_Y, DOCK_ZONE_Y, PULL_DY = 8, 18, 30, 14
     BODY_RECT, BODY_PAD = (48, 12, 192, 92), 4       # obsidian squircle inside the 240x130 window
@@ -2700,7 +2708,8 @@ class LayeredMishWindow(RobotFaceWindow):
         # everything the first animate_loop() tick (inside super().__init__) may touch
         self._sf = _LayeredSurface()
         self._frame_buffers = {}
-        self._shell_cache = None
+        self._shell_cache = OrderedDict()
+        self._isl_cache = OrderedDict()
         self._alpha = float(mish.settings["opacity"])
         self._mode = "float"                         # logical mode: float | handle | island
         self._g = dict(w=float(self.SIZE[0]), h=float(self.SIZE[1]), r=float(self.RADIUS), flat=0.0)
@@ -3200,8 +3209,8 @@ class LayeredMishWindow(RobotFaceWindow):
     @staticmethod
     @lru_cache(maxsize=16)
     def _handle_dot(rgb):
-        S, size = _SS, 24
-        box = (9 * S, 9 * S, 15 * S, 15 * S)
+        S, size = _SS, 18
+        box = (6 * S, 6 * S, 12 * S, 12 * S)
         dot = Image.new("RGBA", (size * S, size * S))
         ImageDraw.Draw(dot).ellipse(box, fill=rgb + (255,))
         dot = dot.filter(ImageFilter.GaussianBlur(3 * S))
@@ -3248,29 +3257,46 @@ class LayeredMishWindow(RobotFaceWindow):
                 x += font.getlength(run) / S
         return layer.resize((w, h), Image.Resampling.LANCZOS)
 
+    def _island_sprite(self, isl):
+        """Cache a complete island at its natural size for motion and steady frames."""
+        st = self._st
+        iw, ih = isl["w"], isl["h"]
+        rgb = st["rgb"] if st else (255, 255, 255)
+        features = (st["eyes"], st["mask"], st["mask_rgb"], st["mask_bob"]) if st else None
+        key = (iw, ih, isl["tx"], tuple(isl["lines"]), rgb, features)
+        sprite = self._isl_cache.get(key)
+        if sprite is not None:
+            self._isl_cache.move_to_end(key)
+            return sprite
+
+        sprite = Image.new("RGBA", (iw, ih))
+        self._mini_eyes(sprite, 25, ih / 2, self.ISLAND_EYE_SCALE)
+        self._draw_sleep_mask(sprite, 25, ih / 2, self.ISLAND_EYE_SCALE, "island")
+        sprite.alpha_composite(self._island_chrome(iw, ih, isl["tx"], tuple(isl["lines"]), rgb))
+        _cache_put(self._isl_cache, key, sprite, 8)
+        return sprite
+
     def _draw_island(self, w, h):
         layer = self._frame_buffer("island", w, h)
-        isl, st = self._isl, self._st
-        if isl:
-            iw, ih = isl["w"], isl["h"]
-            ox, oy = (w - iw) // 2, (h - ih) // 2
-            rgb = st["rgb"] if st else (255, 255, 255)
-            self._mini_eyes(layer, ox + 25, oy + ih / 2, self.ISLAND_EYE_SCALE)
-            self._draw_sleep_mask(layer, ox + 25, oy + ih / 2, self.ISLAND_EYE_SCALE, "island")
-            chrome = self._island_chrome(iw, ih, isl["tx"], tuple(isl["lines"]), rgb)
-            layer.alpha_composite(chrome, (ox, oy))
+        if self._isl:
+            sprite = self._island_sprite(self._isl)
+            layer.alpha_composite(sprite, ((w - sprite.width) // 2, (h - sprite.height) // 2))
         return layer
 
-    def _shell(self, w, h):
-        """Notch / island body: black rounded shell + translucent hairline. Returns (shell RGBA, clip mask L)."""
-        g, S = self._g, _SS
-        key = (w, h, g["r"], g["flat"])
-        if self._shell_cache is not None and self._shell_cache[0] == key:
-            return self._shell_cache[1]
+    def _shell(self, w, h, scale=_SS):
+        """Return the rounded shell and its alpha mask, caching full-quality geometry."""
+        S = scale
+        radius, flat = round(self._g["r"], 1), round(self._g["flat"], 2)
+        key = (w, h, radius, flat)
+        if S == _SS:
+            cached = self._shell_cache.get(key)
+            if cached is not None:
+                self._shell_cache.move_to_end(key)
+                return cached
 
         W, H = w * S, h * S
-        top = -g["flat"] * 2 * g["r"] * S                           # flat top = rounding pushed off the screen edge
-        rad = max(0.0, min(g["r"] * S, (W - 1) / 2.0, (H - 1 - top) / 2.0))
+        top = -flat * 2 * radius * S                                # push rounding off the top edge
+        rad = max(0.0, min(radius * S, (W - 1) / 2.0, (H - 1 - top) / 2.0))
         box = (0, top, W - 1, H - 1)
         mask = Image.new("L", (W, H), 0)
         ImageDraw.Draw(mask).rounded_rectangle(box, radius=rad, fill=255)
@@ -3279,10 +3305,11 @@ class LayeredMishWindow(RobotFaceWindow):
                                                 outline=(255, 255, 255, 46), width=S)
         sprites = (shell.resize((w, h), Image.Resampling.LANCZOS),
                    mask.resize((w, h), Image.Resampling.LANCZOS))
-        self._shell_cache = (key, sprites)
+        if S == _SS:
+            _cache_put(self._shell_cache, key, sprites, 10)
         return sprites
 
-    def _compose(self):
+    def _compose(self, *, shell_scale=_SS):
         g, wt = self._g, self._wt
         w, h = max(1, int(round(g["w"]))), max(1, int(round(g["h"])))
         out = self._frame_buffer("output", w, h)
@@ -3290,7 +3317,7 @@ class LayeredMishWindow(RobotFaceWindow):
             out.alpha_composite(_fade(self._draw_body(w, h), wt["body"]))
         sw = 1.0 - wt["body"]
         if sw > 0.01:
-            shell, mask = self._shell(w, h)
+            shell, mask = self._shell(w, h, shell_scale)
             dock = self._frame_buffer("dock", w, h)
             for name, draw in (("island", self._draw_island), ("handle", self._draw_handle)):
                 if wt[name] > 0.01:
@@ -3430,6 +3457,7 @@ class LayeredMishWindow(RobotFaceWindow):
     # ------------------------------------------------------------------ cancellable morph animation
     def _morph(self, mode: str, seconds: float, done=None, spring: bool = False):
         """Animate the layered surface and commit Tk geometry at the end."""
+        self.root.update_idletasks()                     # flush queued Tk geometry before moving the surface
         src_mode, src_g, src_wt = self._mode, dict(self._g), dict(self._wt)
         sx, sy = self._win_xy()
         dst, dst_wt = self._target(mode), self._weights(mode)
@@ -3442,7 +3470,8 @@ class LayeredMishWindow(RobotFaceWindow):
         def step():
             if tok != self._anim_tok:
                 return
-            t = min(1.0, (time.perf_counter() - t0) / seconds) if seconds > 0 else 1.0
+            frame_start = time.perf_counter()
+            t = min(1.0, (frame_start - t0) / seconds) if seconds > 0 else 1.0
             e = ease_out_back(t, 0.7) if spring else smoothstep(t)
             f = smoothstep(t)
             self._g = {k: src_g[k] + (dst[k] - src_g[k]) * e for k in ("w", "h", "r", "flat")}
@@ -3452,9 +3481,10 @@ class LayeredMishWindow(RobotFaceWindow):
             y = int(round(sy + (dst["y"] - sy) * e))
             try:
                 if t < 1.0:
-                    self._compose()
+                    self._compose(shell_scale=self.MORPH_SS)
                     self._apply(x, y)
-                    self.root.after(12, step)
+                    spent_ms = (time.perf_counter() - frame_start) * 1000
+                    self.root.after(max(1, int(self.MORPH_FRAME_MS - spent_ms)), step)
                     return
 
                 w, h = int(round(self._g["w"])), int(round(self._g["h"]))

@@ -3,14 +3,40 @@ from __future__ import annotations
 import json
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
+from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..config import user_data_dir
 from ..win_utils import log
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 MS_SCOPES = ["User.Read", "Calendars.Read", "Tasks.Read", "Mail.Read", "Mail.Send"]
+
+
+@lru_cache(maxsize=32)
+def _provider_zone(name: str) -> tzinfo:
+    if name.casefold() == "utc":
+        return timezone.utc
+    if not name:
+        raise ValueError("Microsoft deadline has no offset or timeZone")
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        from win32timezone import TimeZoneInfo
+
+        return TimeZoneInfo(name)
+
+
+def _local_deadline(value: dict | None) -> datetime | None:
+    """Convert Graph's dateTimeTimeZone to the local wall time used by Store."""
+    if not value or not value.get("dateTime"):
+        return None
+    due = datetime.fromisoformat(value["dateTime"])
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=_provider_zone((value.get("timeZone") or "").strip()))
+    return due.astimezone().replace(tzinfo=None)
 
 
 class MicrosoftSync:
@@ -139,10 +165,13 @@ class MicrosoftSync:
                 eid = f"ev:{ev['id']}"
                 if eid in seen:
                     continue
-                dt_str = ev.get("start", {}).get("dateTime")
-                if not dt_str:
+                try:
+                    due_dt = _local_deadline(ev.get("start"))
+                except (TypeError, ValueError, OSError, OverflowError) as error:
+                    log("ms: invalid Outlook deadline:", repr(error))
                     continue
-                due_dt = datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+                if due_dt is None:
+                    continue
                 title = f"[Outlook] {ev.get('subject', 'Event').strip()}"
                 task = store.add_task(title, due_dt)
                 seen[eid] = task["id"] if task else "existing"
@@ -167,12 +196,11 @@ class MicrosoftSync:
                     tid = f"todo:{item['id']}"
                     if tid in seen:
                         continue
-                    due_obj = item.get("dueDateTime")
-                    due_dt = (
-                        datetime.fromisoformat(due_obj["dateTime"]).replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
-                        if due_obj and due_obj.get("dateTime")
-                        else None
-                    )
+                    try:
+                        due_dt = _local_deadline(item.get("dueDateTime"))
+                    except (TypeError, ValueError, OSError, OverflowError) as error:
+                        log("ms: invalid To Do deadline:", repr(error))
+                        continue
                     title = f"[ToDo] {item.get('title', 'Task').strip()}"
                     task = store.add_task(title, due_dt)
                     seen[tid] = task["id"] if task else "existing"

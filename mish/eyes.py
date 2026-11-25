@@ -357,11 +357,14 @@ class EyeEngine:
                         [random.uniform(-3.2, 3.2), random.uniform(-2.2, 2.2)]
                     self.next_saccade = now + random.uniform(1.0, 3.8) / wander
                 tx, ty = self.goal
-        dt = min(dt, 0.04)                                          # keeps the explicit integrator stable
-        for i, goal in enumerate((tx, ty)):                         # 2D damped harmonic spring
-            acc = self.STIFFNESS * (goal - self.gaze[i]) - self.DAMPING * self.vel[i]
-            self.vel[i] += acc * dt
-            self.gaze[i] = clamp(self.gaze[i] + self.vel[i] * dt, -5.0, 5.0)
+        remaining = dt
+        while remaining > 1e-6:
+            step = min(remaining, 0.02)                             # keep the spring stable after slow frames
+            for i, goal in enumerate((tx, ty)):
+                acc = self.STIFFNESS * (goal - self.gaze[i]) - self.DAMPING * self.vel[i]
+                self.vel[i] += acc * step
+                self.gaze[i] = clamp(self.gaze[i] + self.vel[i] * step, -5.0, 5.0)
+            remaining -= step
 
     # ---- drawing -----------------------------------------------------------------------
     def cells(self, now: float) -> dict:

@@ -11,6 +11,7 @@ import ast
 import ctypes
 import io
 import json
+import random
 import re
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from .config import (
     ACTIVITY_KEEP,
     APP_DIR,
     DATA_DIR,
+    DEADLINE_REMINDER_ANCHORS,
     FACT_LIMIT,
     FILE_CHAR_LIMIT,
     FILE_READ_BYTES,
@@ -37,6 +39,7 @@ from .config import (
     RENAG_INTERVAL,
     SLACK_KEYWORDS,
     STATS_KEEP_DAYS,
+    TASK_SNOOZE_S,
     TEXT_EXTS,
     WORK_KEYWORDS,
 )
@@ -449,6 +452,25 @@ def launch_app(target: str, args: list[str], aliases: dict, allow_any: bool = Tr
     return False
 
 
+def _deadline_timestamp(value: str | None) -> float | None:
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _deadline_interval(seconds_left: float) -> float:
+    anchors = DEADLINE_REMINDER_ANCHORS
+    if seconds_left <= anchors[0][0]:
+        return random.uniform(*anchors[0][1:])
+    for (near, low, high), (far, far_low, far_high) in zip(anchors, anchors[1:]):
+        if seconds_left <= far:
+            weight = (seconds_left - near) / (far - near)
+            return random.uniform(low + (far_low - low) * weight,
+                                  high + (far_high - high) * weight)
+    return random.uniform(*anchors[-1][1:])
+
+
 # 4. STORE (memory.json)
 class Store:
     """Tasks, facts (text -> strength), chat history, screen notes and usage stats, saved atomically."""
@@ -458,6 +480,7 @@ class Store:
         self.lock = threading.RLock()
         self._dirty = False
         self.data, needs_save = self._load()
+        self._reminder_times: dict[int, tuple[str, bool, float]] = {}
         self.on_complete = None
         self._changes = threading.Condition(self.lock)
         self._revision = self._written_revision = 0
@@ -652,25 +675,76 @@ class Store:
                 self.data["tasks"].remove(task)
                 self.save()
 
-    def due_for_nag(self, now: datetime) -> list:
-        out = []
-        with self.lock:
-            for t in self.data["tasks"]:
-                if t["done"] or not t["due"] or datetime.fromisoformat(t["due"]) > now:
-                    continue
-                if t["nags"] == 0:
-                    out.append(t)
-                elif (t["nags"] <= MAX_RENAGS and t["last_nag"]
-                      and (now - datetime.fromisoformat(t["last_nag"])).total_seconds() >= RENAG_INTERVAL):
-                    out.append(t)
-        return out
-
-    def mark_nagged(self, task: dict):
+    def snooze_task(self, task_id: int) -> dict | None:
         with self.lock:
             self._check_open()
-            task["nags"] += 1
-            task["last_nag"] = now_iso()
-            self.save()
+            for task in self.data["tasks"]:
+                if task["id"] == task_id and not task["done"]:
+                    task["reminder_snoozed_until"] = time.time() + TASK_SNOOZE_S
+                    self._reminder_times.pop(task_id, None)
+                    self.save()
+                    return task.copy()
+        return None
+
+    def due_for_nag(self, now: float, *, reset: bool = False) -> list[tuple[dict, bool]]:
+        """Seed or poll deadlines. Return snapshots with an overdue flag, oldest eligible first."""
+        ready = []
+        with self.lock:
+            previous = {} if reset else self._reminder_times
+            planned = {}
+            for task in self.data["tasks"]:
+                if task["done"]:
+                    continue
+                due = _deadline_timestamp(task.get("due"))
+                if due is None or due - now > DEADLINE_REMINDER_ANCHORS[-1][0]:
+                    continue
+                snoozed_until = task.get("reminder_snoozed_until")
+                snoozed = isinstance(snoozed_until, (int, float)) and snoozed_until > now
+                overdue = due <= now
+                nags = task.get("nags", 0)
+                last_nag = _deadline_timestamp(task.get("last_nag")) if overdue and nags else None
+                if overdue and (nags > MAX_RENAGS or (nags and last_nag is None)):
+                    continue
+
+                key = (task["due"], overdue)
+                plan = previous.get(task["id"])
+                if snoozed:
+                    when = snoozed_until
+                elif plan is not None and plan[:2] == key:
+                    when = plan[2]
+                elif not overdue:
+                    when = now + _deadline_interval(due - now)
+                elif reset:
+                    when = now + RENAG_INTERVAL
+                else:
+                    when = now if last_nag is None else last_nag + RENAG_INTERVAL
+                planned[task["id"]] = (*key, when)
+                if when <= now:
+                    ready.append((overdue, when, due, task.copy()))
+            self._reminder_times = planned
+        ready.sort(key=lambda item: (not item[0], item[1], item[2], item[3]["id"]))
+        return [(task, overdue) for overdue, _, _, task in ready]
+
+    def mark_nagged(self, snapshot: dict, overdue: bool, now: float) -> bool:
+        """Claim one planned reminder if the task has not changed since polling."""
+        task_id = snapshot["id"]
+        with self.lock:
+            self._check_open()
+            plan = self._reminder_times.get(task_id)
+            if plan is None or plan[:2] != (snapshot["due"], overdue) or plan[2] > now:
+                return False
+            task = next((item for item in self.data["tasks"] if item["id"] == task_id), None)
+            if task is None or task["done"] or task["due"] != snapshot["due"]:
+                return False
+            if overdue:
+                self._reminder_times[task_id] = (*plan[:2], now + RENAG_INTERVAL)
+                task["nags"] = task.get("nags", 0) + 1
+                task["last_nag"] = datetime.fromtimestamp(now).isoformat(timespec="seconds")
+                self.save()
+            else:
+                due = _deadline_timestamp(task["due"])
+                self._reminder_times[task_id] = (*plan[:2], now + _deadline_interval(due - now))
+            return True
 
     # ---- facts ----------------------------------------------------------------
     def facts_sorted(self) -> list:

@@ -40,7 +40,7 @@ REACTION_COOLDOWN = 45           # seconds between window-switch reactions
 
 AMBIENT_MIN_GAP = 90             # minimum seconds between any unsolicited popups
 BRAIN_IDLE_UNLOAD_S = 15 * 60    # release the auto-mode GGUF after 15m idle
-__version__ = "0.5.70"
+__version__ = "0.6.00"
 DEFAULT_SETTINGS = {"dev": 0, "brain_mode": "auto", "brain_context": "main",
                     "profile": "neutral", "profile_auto": 1}
 HOTKEY_MOD = 0x0001 | 0x4000     # MOD_ALT | MOD_NOREPEAT
@@ -87,6 +87,13 @@ AUTO_SLEEP_TIMEOUT = 5 * 60
 BORED_AFTER = 60                 # idle seconds before his eyes go bored
 DROWSY_AFTER = AUTO_SLEEP_TIMEOUT // 2
 SCHEDULER_TICK = 15
+DEADLINE_REMINDER_ANCHORS = (     # (seconds until due, minimum interval, maximum interval)
+    (2 * 3600, 60, 120),
+    (6 * 3600, 480, 720),
+    (24 * 3600, 720, 1800),
+    (7 * 86400, 1800, 7200),
+)
+TASK_SNOOZE_S = 3600
 RENAG_INTERVAL = 5 * 60          # seconds between repeat nags for an overdue task
 MAX_RENAGS = 3
 STATS_KEEP_DAYS = 14

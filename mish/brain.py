@@ -81,7 +81,7 @@ from .config import (
     __version__,
 )
 from .eyes import SHAPES
-from .store import Store, task_due, task_source
+from .store import Store, match_task_reference, task_due, task_source
 from .win_utils import (
     _key_event,
     _known_apps,
@@ -488,6 +488,8 @@ class Mish:
         self._ram_sample: tuple[float, float] | None = None
         self._heavy_since = self._clear_since = None
         self._last_pressure_nag = 0.0
+        self._task_reference: tuple[float, int] | None = None
+        self._task_ack_choices: tuple[float, dict[int, int]] | None = None
         self._last_ambient_say = 0.0
         self._errand_busy = False                   # an !open errand is running
         self._errand_t = 0.0
@@ -790,9 +792,14 @@ class Mish:
             self.say("No pending tasks right now.")
             return
         task = tasks[0]
-        due = fmt_due(task["due"]) if task["due"] else "soon"
+        deadline = task_due(task)
+        due = fmt_due(deadline.isoformat()) if deadline else "soon"
         line = self._canned("nag", task=task["text"], due=due)
-        self.say(line or f"Pending task: {task['text']}.", expr="squint")
+        if task["text"].casefold() not in line.casefold():
+            line = f"{line}\nPending task: {task['text']}.".lstrip()
+        with self._mood_lock:
+            self._task_reference = (time.monotonic(), task["id"])
+            self.say(line, expr="squint")
 
     def focus_punish_say(self, window_title: str):
         if not self.strike_mode:
@@ -1019,32 +1026,32 @@ class Mish:
             return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
         with self._mood_lock:
-            profile, mood, annoyance = self.active_profile, self._mood_tier(), self.annoyance
+            profile, mood = self.active_profile, self._mood_tier()
             app = self._live_friendly
             phase, paused, left = self._timer_snapshot()
-        lines = [f"State: profile={profile} | mood={mood} ({annoyance}/100) | app={short(app, 42)}",
-                 f"Current time: {datetime.now():%a %H:%M}"]
+        state = f"State: mood={mood} | app={short(app, 36)} | {profile} | {datetime.now():%a %H:%M}"
         if paused > 0:
-            lines.append(f"Focus paused: {fmt_dur(paused)} left")
+            state += f" | focus paused {fmt_dur(paused)}"
         elif phase in ("work", "break") and left > 0:
-            label = "Focus" if phase == "work" else "Break"
-            lines.append(f"{label}: {fmt_dur(left)} left")
+            label = "focus" if phase == "work" else "break"
+            state += f" | {label} {fmt_dur(left)} left"
 
+        entries = []
         for task in self.store.relevant_tasks(query):
             due = task_due(task)
             suffix = f" (due {due:%a %H:%M})" if due else ""
-            lines.append(f"Task: {short(task['text'], width - len(suffix))}{suffix}")
+            entries.append(("Task: ", task["text"], suffix))
         for fact in self.store.relevant_facts(query):
-            lines.append(f"Fact: {short(fact['text'], width)}")
+            entries.append(("Fact: ", fact["text"], ""))
+        if not entries:
+            return state
 
-        kept, size = [], 0
-        for line in lines:
-            extra = len(line) + bool(kept)
-            if size + extra > budget:
-                break
-            kept.append(line)
-            size += extra
-        return "\n".join(kept)
+        # Give each selected item space within the grounded context cap.
+        item_width = min(width, (budget - len(state)) // len(entries) - 1)
+        lines = [state]
+        for label, text, suffix in entries:
+            lines.append(f"{label}{short(text, item_width - len(label) - len(suffix))}{suffix}")
+        return "\n".join(lines)
 
     def generate(self, event: str, window: str = "", user_text: str | None = None,
                  extra: str = "", bypass_cooldown: bool = False) -> str:
@@ -1297,9 +1304,12 @@ class Mish:
         tasks = self.store.pending()
         if not tasks:
             return "No pending tasks."
-        return "Tasks:\n" + "\n".join(
-            f"#{i} {t['text']}" + (f" - due {fmt_due(t['due'])}" if t["due"] else "")
-            for i, t in enumerate(tasks, 1))
+        lines = ["Tasks:"]
+        for i, task in enumerate(tasks, 1):
+            due = task_due(task)
+            suffix = f" - due {fmt_due(due.isoformat())}" if due else ""
+            lines.append(f"#{i} {task['text']}{suffix}")
+        return "\n".join(lines)
 
     def facts_text(self) -> str:
         items = self.store.facts_sorted()
@@ -1310,6 +1320,101 @@ class Mish:
     def stats_text(self) -> str:
         s = self.store.today_stats()
         return f"Work: {fmt_dur(s['work'])} | Slack: {fmt_dur(s['slack'])}"
+
+    _TASK_ACK_TTL = 300
+    _TASK_ACK = re.compile(
+        r"^(?:(?:yes|yeah|okay|ok|sure|hey mish)[,\s]+)?"
+        r"(?:(?:i(?:'ve| have)? (?:(?:just|already) )?)?"
+        r"(?:started|began|got started)(?: (?:to work on|working on|on))?\b"
+        r"|(?:i(?:'m| am|'ve been| have been) (?:(?:already|currently|now|actively) )?)?"
+        r"(?:working on|handling|taking care of|getting started on|starting(?: on)?|doing)\b"
+        r"|i(?:'ll| will) (?:handle|take care of)\b"
+        r"|i(?:'m| am) (?:already )?on (?=it\b|this\b|that\b)"
+        r"|(?:i(?:'ve| have) )?got (?=it\b|this\b|that\b))"
+        r"\s*(.*)$"
+    )
+    _TASK_ACK_PRONOUNS = frozenset({"", "it", "this", "that", "that one", "this one",
+                                   "the task", "that task", "this task", "my task"})
+
+    def _handle_task_ack(self, text: str) -> str | None:
+        """Use an explicit task, recent discussion/reminder, or a clarification reply."""
+        normalized = " ".join(text.casefold().replace("’", "'").split()).rstrip(".! ")
+        now = time.monotonic()
+        with self._mood_lock:
+            context, choices = self._task_reference, self._task_ack_choices
+            self._task_ack_choices = None
+
+        if choices and now - choices[0] > self._TASK_ACK_TTL:
+            choices = None
+        ack = self._TASK_ACK.fullmatch(normalized)
+        if ack and (normalized.endswith("?") or re.search(
+                r"\b(?:not|never|later|tomorrow|next (?:week|month)|haven't|didn't|yet)\b", ack[1])):
+            ack = None
+        pending = self.store.pending_snapshot()
+        if not pending:
+            return "There are no pending tasks to snooze." if ack else None
+
+        if ack:
+            ref = re.sub(r"(?:,?\s+(?:right now|now|already|as we speak|thanks|covered))+$", "", ack[1])
+            ref = re.sub(r"^(?:the|my)\s+", "", ref) if ref not in self._TASK_ACK_PRONOUNS else ref
+            if ref in self._TASK_ACK_PRONOUNS:
+                if choices:
+                    pending = [task for task in pending if task["id"] in choices[1].values()]
+                matches = [task for task in pending
+                           if not choices and context and now - context[0] <= self._TASK_ACK_TTL
+                           and task["id"] == context[1]]
+                if not matches and len(pending) == 1:
+                    matches = pending
+            else:
+                matches = self._match_ack_reference(ref, pending)
+        elif choices:
+            offered = [task for task in pending if task["id"] in choices[1].values()]
+            if re.fullmatch(r"#?[0-9]+", normalized):
+                selected = choices[1].get(int(normalized.lstrip("#")))
+                matches = [task for task in offered if task["id"] == selected]
+            else:
+                matches = match_task_reference(normalized, offered)
+                if not matches:
+                    self._remember_task_mention(text, pending, now)
+                    return None
+            pending = offered
+        else:
+            self._remember_task_mention(text, pending, now)
+            return None
+
+        if len(matches) == 1:
+            task = self.store.snooze_task(matches[0]["id"])
+            if task is None:
+                return "That task is no longer pending."
+            with self._mood_lock:
+                self._task_reference = (now, task["id"])
+            return f"I’ll snooze reminders for {task['text']} for one hour."
+
+        options = matches or pending
+        # Keep the clarification short and accept task names beyond the examples.
+        numbered = self.store.pending()
+        labels = {task["id"]: i for i, task in enumerate(numbered, 1)}
+        options = [task for task in options if task["id"] in labels]
+        if not options:
+            return "There are no pending tasks to snooze."
+        with self._mood_lock:
+            self._task_ack_choices = (now, {labels[task["id"]]: task["id"] for task in options})
+        examples = " / ".join(f"#{labels[task['id']]} {task['text'][:60]}" for task in options[:3])
+        return f"Which task are you working on? {examples}"
+
+    def _match_ack_reference(self, reference: str, pending: list[dict]) -> list[dict]:
+        if re.fullmatch(r"#?[0-9]+", reference):
+            task = self.store.resolve_task(reference)
+            return [item for item in pending if task and item["id"] == task["id"]]
+        return match_task_reference(reference, pending)
+
+    def _remember_task_mention(self, text: str, pending: list[dict], now: float, *, keep_if_absent: bool = False):
+        matches = match_task_reference(text, pending, in_context=True)
+        if not matches and keep_if_absent:
+            return
+        with self._mood_lock:
+            if self._task_reference is None or self._task_reference[0] <= now:
+                self._task_reference = (now, matches[0]["id"]) if len(matches) == 1 else None
 
     # ---- plain-text commands ------------------------------------------------------------
     def handle_command(self, raw: str) -> str | None:
@@ -1953,16 +2058,15 @@ class Mish:
                 self.say(out)
             return
 
-        if self.strike_mode:
-            hub_reply = self._cmd_hub(text, text.strip().lower())
-            if hub_reply is not None:
-                self.say(hub_reply)
-            else:
-                self.say(self._canned("strike_chat"), expr="strike")
-            return
-        reply = self.handle_command(text)
+        on_strike = self.strike_mode
+        reply = self._cmd_hub(text, text.strip().lower()) if on_strike else self.handle_command(text)
+        if reply is None:
+            reply = self._handle_task_ack(text)
         if reply is not None:
             self.say(reply)
+            return
+        if on_strike:
+            self.say(self._canned("strike_chat"), expr="strike")
             return
 
         low = text.strip().lower()
@@ -1981,6 +2085,7 @@ class Mish:
         if self.brain.want == "off":
             self.say(self._canned("brain_off") or "Brain is off. Use !brain auto or !brain on.", expr="sad")
             return
+        chat_started = time.monotonic()
         reply = self._generate_owned("chat", user_text=text)
         if not reply:
             self.say("Brain unavailable. Check for a .gguf in models/ and see Mish.log.", expr="sad")
@@ -1996,6 +2101,7 @@ class Mish:
                 reply = f"I don't know where {app} lives. Teach me with !alias {app} <path>"
         self.store.add_history("user", text)
         self.store.add_history("assistant", reply)
+        self._remember_task_mention(reply, self.store.pending_snapshot(), chat_started, keep_if_absent=True)
         self.say(reply)
 
     # ---- background loops ----------------------------------------------------------------------
@@ -2076,21 +2182,41 @@ class Mish:
                     return
 
     def scheduler_loop(self):
-        while True:
+        last_poll = None
+        while not self.stop_event.is_set():
             try:
+                now = time.time()
+                idle = idle_seconds()
+                reset = last_poll is None
+                if last_poll is not None:
+                    last_time, last_idle = last_poll
+                    elapsed = now - last_time
+                    reset = (not 0 <= elapsed <= 2 * SCHEDULER_TICK or last_idle >= IDLE_PAUSE
+                             or (idle < elapsed and last_idle + elapsed - idle >= IDLE_PAUSE))
+                last_poll = (now, idle)
                 self.store.run_daily_decay()
-                if not self._profile_mutes("nag"):
-                    for task in self.store.due_for_nag(datetime.now()):
-                        with self._mood_lock:
+                if idle < IDLE_PAUSE:
+                    ready = self.store.due_for_nag(now, reset=reset)
+                    for task, overdue in ready:
+                        if self._profile_mutes("nag"):
+                            break
+                        if overdue:
+                            line = self._ambient_line("nag", extra=task["text"])
+                            if task["text"].casefold() not in line.casefold():
+                                line = f"{line}\nTask due: {task['text']}".lstrip()
+                        else:
+                            due = task_due(task)
+                            line = f"Upcoming deadline: {task['text']} — due {fmt_due(due.isoformat())}."
+                        with self._mood_lock, self.store.lock:
                             if self._profile_mutes("nag"):
                                 break
-                            self._bump_annoyance(ANNOY_NAG_STEP)
-                        line = self._ambient_line("nag", extra=task["text"])
-                        with self._mood_lock:
-                            if self._profile_mutes("nag"):
-                                break
-                            self.say(line or f"Task due: {task['text']}", expr="squint")
-                        self.store.mark_nagged(task)
+                            if not self.store.mark_nagged(task, overdue, now):
+                                continue
+                            if overdue:
+                                self._bump_annoyance(ANNOY_NAG_STEP)
+                            self._task_reference = (time.monotonic(), task["id"])
+                            self.say(line, expr="squint")
+                        break  # Let one reminder display at a time.
                 self._nag_memory_pressure()
             except Exception as e:
                 log("scheduler_loop error:", repr(e))
